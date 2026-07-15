@@ -1,0 +1,44 @@
+[project]
+name = "faultdiagnose"
+version = "0.1.0"
+description = "Reproducing hybrid autoencoder-based early fault detection for wind turbines (Nair & Babu, 2025) on the CARE SCADA dataset."
+readme = "README.md"
+authors = [
+    { name = "InfiHeart", email = "785783195@qq.com" }
+]
+requires-python = ">=3.13.9,<3.14"
+dependencies = [
+    "torch>=2.5.0",
+    "matplotlib>=3.11.0",
+    "numpy>=2.5.1",
+    "pandas>=3.0.3",
+    "pytest>=9.1.1",
+    "ruff>=0.15.21",
+    "scikit-learn>=1.9.0",
+    "scipy>=1.18.0",
+    "tqdm>=4.68.4",
+    "pyarrow>=25.0.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]

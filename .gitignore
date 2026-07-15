@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Large dataset (download separately; see README)
+CARE_To_Compare/
+CARE_To_Compare.zip
+data/
+results/
+notebooks/.ipynb_checkpoints/
+
+# Tooling caches
+.ruff_cache/
