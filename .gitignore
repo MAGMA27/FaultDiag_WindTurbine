@@ -1,4 +1,4 @@
-# Python-generated files
+﻿# Python-generated files
 __pycache__/
 *.py[oc]
 build/
@@ -12,9 +12,10 @@ wheels/
 # Large dataset (download separately; see README)
 CARE_To_Compare/
 CARE_To_Compare.zip
-data/
+/data/
 results/
 notebooks/.ipynb_checkpoints/
 
 # Tooling caches
 .ruff_cache/
+
