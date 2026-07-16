@@ -58,3 +58,14 @@ un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardiz
   1. 保持特征工程与论文一致, 不裁剪低方差列 (准常数特征可能含错误状态信息; 论文未做此步, 复现须对齐)。
   2. 正负比 ~0.24% (2522/1053180), AUC 对少量正样本本就难拉高 -> 确认标签/窗口逻辑无误。
   3. 跨风场: 论文 0.947 是 Farm B 集成结果, 当前只在 Farm A 单模, 差距部分来自此。
+
+### Phase 5 补充: 特征工程重复统计问题 (2026-07-16)
+- **洞察 (用户发现)**: Farm A 原始 81 列 = 54 个 base sensor, 其中 9 个已是 CARE 预聚合的统计值列 (四件套 _avg/_max/_min/_std):
+  wind_speed_3, sensor_5, sensor_18, reactive_power_27, reactive_power_28, power_29, power_30, sensor_31, sensor_52。
+  其余 45 个为瞬时读数单值列。
+- **问题**: engineer_features 对每一列 (不分原始/已统计) 统一套 _mean/_std/_skew/_kurt/_deriv/_deriv2 (窗口24)。
+  即对 power_29_std 再算 _std/_mean/_kurt (波动量的波动), 对 sensor_5_max 算 _mean/_std (最大值的平均/标准差)。
+  这属于"统计值的统计值", 语义稀薄且与同源原始列强相关 -> 注入冗余低信息维度, 稀释异常信号 (567 维噪声来源之一)。
+- **论文对照**: Nair & Babu 2025 Sec.II.A 的滑动窗口特征工程默认输入为原始瞬时读数; CARE 混合了原始+预聚合列, 论文 pipeline 未考虑此混合。严格对齐论文应只对原始瞬时列做派生 (或仅用其 _avg)。但论文缺细节, 无法确认其实际处理。
+- **状态**: 暂不改默认 pipeline (改动 in_dim/checkpoint 成本高, 且非当前 AUC 差距主因; beta 才是)。记录为已知方法论问题。
+- **下一步验证 (未做)**: 加开关"跳过预聚合列 (仅保留其 _avg 作原始输入)"跑对照, 确认重复统计是否伤性能。另: 换 window 大小做快速验证 (见下)。
