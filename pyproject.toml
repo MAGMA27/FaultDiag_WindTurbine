@@ -35,10 +35,16 @@ select = ["E", "F", "I", "W"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
+torch = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[dependency-groups]
+dev = [
+    "pymupdf>=1.28.0",
+]

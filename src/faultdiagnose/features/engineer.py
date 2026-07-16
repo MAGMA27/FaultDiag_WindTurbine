@@ -7,13 +7,20 @@ KEY_COLS = ("farm", "dataset_id", "asset_id", "time_stamp", "id", "status_type_i
 DEFAULT_WIN = 24  # feature window = 4h (24 x 10-min steps); configurable
 
 
-# ponytail: dominant non-DC spectral magnitude over a window; cheap rfft, called per window.
-# NOTE: only used when use_fft=True; rolling.apply is a Python callback per window and is the
-# perf ceiling at scale. Replace with a stride-trick sliding FFT if FFT is needed on full data.
-def _fft_dominant_magnitude(x: np.ndarray) -> float:
-    x = x - x.mean()
-    mags = np.abs(np.fft.rfft(x))[1:]
-    return float(mags.max()) if mags.size else 0.0
+# ponytail: dominant non-DC spectral magnitude over a sliding window, vectorized via
+# sliding_window_view + rfft (replaces the old rolling.apply callback, which was the perf ceiling).
+def _fft_dominant_feature(values: np.ndarray, window: int) -> np.ndarray:
+    n = len(values)
+    feat = np.full(n, np.nan, dtype=np.float64)
+    if n < window:
+        return feat
+    sw = np.lib.stride_tricks.sliding_window_view(
+        np.asarray(values, dtype=np.float64), window
+    )
+    sw = sw - sw.mean(axis=1, keepdims=True)  # remove DC before FFT
+    spec = np.abs(np.fft.rfft(sw, axis=1))[:, 1:]  # drop DC bin
+    feat[window - 1 :] = spec.max(axis=1)
+    return feat
 
 
 def select_feature_columns(df: pd.DataFrame) -> list[str]:
@@ -27,26 +34,45 @@ def engineer_features(
     columns: list[str] | None = None,
     include_raw: bool = False,
     use_fft: bool = False,
+    fillna: str | None = "ffill",
+    clip_sigma: float | None = 5.0,
 ) -> pd.DataFrame:
     """Sliding-window temporal/statistical/frequency features (paper Section II.A).
 
-    Per input column emits: _mean, _std, _skew, _kurt, _deriv [+ _fft if use_fft].
+    Per input column emits: _mean, _std, _skew, _kurt, _deriv, _deriv2 [+ _fft if use_fft].
     Leading window rows are NaN (min_periods=window); dropna before sequencing.
+
+    fillna: gap-fill strategy on raw sensors before feature extraction
+           ("ffill"/"bfill"/"median"/None). Keeps sliding windows aligned.
+    clip_sigma: clip raw sensors to +/-clip_sigma robust z after fill, to kill
+           sensor spikes that survive as finite but huge values. None = off.
     """
     if columns is None:
         columns = select_feature_columns(df)
     out: dict[str, pd.Series] = {}
+    # ponytail: fill gaps first (keep window alignment), then clip spikes;
+    # robust mean/std for clipping computed per-column on the filled series.
+    filled_cache: dict[str, pd.Series] = {}
     for col in columns:
         s = df[col].astype(float)
+        if fillna is not None:
+            if fillna == "median":
+                s = s.fillna(s.median())
+            s = s.ffill().bfill()
+        if clip_sigma is not None:
+            mu, sd = s.mean(), s.std()
+            if sd and np.isfinite(sd) and sd > 0:
+                s = s.clip(mu - clip_sigma * sd, mu + clip_sigma * sd)
+        filled_cache[col] = s
+        s = filled_cache[col]
         out[f"{col}_mean"] = s.rolling(window, min_periods=window).mean()
         out[f"{col}_std"] = s.rolling(window, min_periods=window).std()
         out[f"{col}_skew"] = s.rolling(window, min_periods=window).skew()
         out[f"{col}_kurt"] = s.rolling(window, min_periods=window).kurt()
         out[f"{col}_deriv"] = s.diff()
+        out[f"{col}_deriv2"] = s.diff().diff()  # x_t - 2x_{t-1} + x_{t-2}
         if use_fft:
-            out[f"{col}_fft"] = s.rolling(window, min_periods=window).apply(
-                _fft_dominant_magnitude, raw=True
-            )
+            out[f"{col}_fft"] = _fft_dominant_feature(s.to_numpy(), window)
         if include_raw:
             out[f"{col}_raw"] = s
     # ponytail: build from dict in one shot to avoid per-column DataFrame fragmentation
@@ -74,10 +100,12 @@ def iter_sequences(features: pd.DataFrame, seq_len: int):
 def fit_standardizer(features) -> tuple[np.ndarray, np.ndarray]:
     """z-score stats (mean, std) per column, positionally. Works on DataFrame or ndarray."""
     arr = features.values if hasattr(features, "values") else np.asarray(features)
-    return arr.mean(axis=0), arr.std(axis=0)
+    # ponytail: dead/constant sensors (std~0 or non-finite) poison z-score -> 1.0 so x-mean stays finite
+    return arr.mean(axis=0), np.nan_to_num(arr.std(axis=0), nan=1.0, posinf=1.0, neginf=1.0)
 
 
 def apply_standardizer(features, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     arr = features.values if hasattr(features, "values") else np.asarray(features)
-    std = np.where(std == 0, 1.0, std)
+    std = np.where(np.isfinite(std) & (std != 0), std, 1.0)
+    mean = np.where(np.isfinite(mean), mean, 0.0)
     return (arr - mean) / std

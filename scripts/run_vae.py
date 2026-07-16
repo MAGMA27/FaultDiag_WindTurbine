@@ -34,7 +34,7 @@ def collect_training(farms, window, cap, use_fft=False):
         for did in normal_ids.get(farm, []):
             df = load_dataset(OUT, farm, did)
             cols = select_feature_columns(df)
-            feats = engineer_features(df, window=window, columns=cols, use_fft=use_fft).dropna()
+            feats = engineer_features(df, window=window, columns=cols, use_fft=use_fft, fillna="ffill", clip_sigma=5.0).dropna()
             vecs.append(feats.values.astype(np.float32))
             total += len(feats)
             if total >= cap:
@@ -54,7 +54,7 @@ def evaluate(farms, window, model, mean, std, ev_map, use_fft=False):
         for did in list_datasets(OUT, farm):
             df = load_dataset(OUT, farm, did)
             cols = select_feature_columns(df)
-            feats = engineer_features(df, window=window, columns=cols, use_fft=use_fft)
+            feats = engineer_features(df, window=window, columns=cols, use_fft=use_fft, fillna="ffill", clip_sigma=5.0)
             times = df.loc[feats.index, "time_stamp"]
             feats = feats.dropna()
             times = times.loc[feats.index]

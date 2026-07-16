@@ -12,6 +12,13 @@ OUT_DEFAULT = REPO_ROOT / "data" / "processed"
 FARMS = {"A": "Wind Farm A", "B": "Wind Farm B", "C": "Wind Farm C"}
 KEY_COLS = ("farm", "dataset_id", "asset_id", "time_stamp", "id", "status_type_id", "train_test")
 
+# CARE status_type_id: 0 normal generation / 1 power-limited / 2 idling /
+# 3 maintenance / 4 shutdown / 5 other. Only 0 and 2 are genuine operating
+# states. Fault events are labelled over the post-fault downtime window
+# (status 3/4), which is flat and not an early-fault signal, so train/score
+# must be restricted to operating rows.
+OPERATING_STATES = frozenset({0, 2})
+
 # ponytail: 匿名 CSV 里把 ° 编码成了乱码，轻量修一下单位列
 _DEG_FIXES = [("锟紺", "°"), ("锟?", "°")]
 
@@ -114,6 +121,13 @@ def list_datasets(out_root: Path, farm: str | None = None) -> list[str]:
     return [f"farm_{m}" for m in FARMS]
 
 
+def operating_mask(df: pd.DataFrame) -> pd.Series:
+    """Boolean mask of rows where the turbine is in an operating state (0/2)."""
+    if "status_type_id" not in df.columns:
+        return pd.Series(True, index=df.index)
+    return df["status_type_id"].isin(OPERATING_STATES)
+
+
 def iter_farm(out_root: Path, farm: str):
     """逐个 dataset 产出 (dataset_id, DataFrame)，避免一次性把整风场读进内存。"""
     for p in sorted((Path(out_root) / f"farm_{farm}").glob("*.parquet")):
@@ -130,5 +144,8 @@ if __name__ == "__main__":
     m = convert_care_to_parquet(args.raw, args.out)
     print("Conversion done.")
     for f, info in m["farms"].items():
-        print(f"  farm {f}: {info['n_datasets']} datasets, {info['n_rows']} rows, {info['n_features']} features")
+        print(
+            f"  farm {f}: {info['n_datasets']} datasets, "
+            f"{info['n_rows']} rows, {info['n_features']} features"
+        )
     print(f"TOTAL: {m['total_datasets']} datasets, {m['total_rows']} rows")

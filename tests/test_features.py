@@ -27,7 +27,7 @@ def _sample():
 def test_engineer_shapes_and_finite():
     df, cols = _sample()
     feats = engineer_features(df, window=24, columns=cols, use_fft=True)
-    assert feats.shape[1] == len(cols) * 6
+    assert feats.shape[1] == len(cols) * 7  # mean/std/skew/kurt/deriv/deriv2 + fft
     clean = feats.dropna()
     assert len(clean) > 1000
     assert np.isfinite(clean.to_numpy()).all()

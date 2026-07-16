@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -40,6 +40,10 @@ class VAE(nn.Module):
 
     @staticmethod
     def reparameterize(mu, logvar):
+        # ponytail: clamp logvar so std can't blow up to Inf mid-training;
+        # an unconstrained posterior sigma is what produced the 1e8 loss spikes.
+        # +/-10 -> std in [e^-5, e^5], well within float range.
+        logvar = torch.clamp(logvar, -10.0, 10.0)
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 
@@ -59,5 +63,9 @@ class VAE(nn.Module):
     @torch.no_grad()
     def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
         self.eval()
-        recon, _, _ = self(x)
-        return ((recon - x) ** 2).sum(dim=1)
+        recon, mu, logvar = self(x)
+        per_sample_recon = ((recon - x) ** 2).sum(dim=1)
+        per_sample_kld = -0.5 * torch.sum(
+            1 + logvar - mu.pow(2) - logvar.exp(), dim=1
+        )
+        return self.alpha * per_sample_recon + self.beta * per_sample_kld
