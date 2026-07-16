@@ -100,3 +100,14 @@ un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardiz
   - latent 假设: 加 vae_h256_l128_b0.1 验证 64->128 是否继续涨 (window=96 更复杂可能 latent 偏小)。
   - beta 软约束: 试 beta=0.3~0.5 看能否替代硬 clamp 且 AUC 更高。
   - 跨风场: 论文 0.947 为 Farm B 集成, Farm A 单模论文表 0.823, 当前 0.72 仍有差距待追。
+
+### Phase 5 补充: LSTM/Transformer AE 架构澄清 (2026-07-16)
+- **无 mu/sigma**: LSTM-AE 与 Transformer-AE 是确定性自编码器, 压缩产物是固定向量 z, 无分布/采样/KL, 不生成 mu 与 sigma (mu/sigma 仅 VAE 所有)。故不会遇 VAE 的 mu 漂移 nan 崩溃。
+- **LSTMAE**: 编码器 LSTM 读完全部时间步取最后隐藏状态 -> z; 解码器 LSTM 从 z 自回归(递归)解出 T 个时间步。捕捉时间先后顺序依赖。
+- **TransformerAE** (代码确认): 
+  - 编码: x -> in_proj -> pos(位置编码) -> TransformerEncoder -> 对全部时间步 .mean(dim=1) 平均池化 -> pool 线性层 -> z。 z 是整段序列平均 (非末 token)。
+  - 解码: z -> unpool -> 复制 T 份 (广播) -> pos -> TransformerEncoder -> out 线性层 -> 一次性并行输出整段 recon (非自回归, 非 token 递归生成)。
+  - 异常分数 = 整段 MSE ((recon-x)^2).mean(dim=(1,2))。
+- **与语言模型区别**: 用户直觉的 decoder-only 自回归 (末 token -> 线性 -> 逐 token 生成) 是 GPT 式做法; 本检测 AE 是非自回归并行重建, 训练直接用整段 MSE, 无误差累积。
+- **对比口径注意**: seq 模型 seq_len 在 config 锁死 24, 不随 --window 变化; --window 只改 engineer_features 的滑动窗口统计, 不改模型自身时间步感受野。VAE window=96 变好部分来自特征统计窗口变大; LSTM/TF 本应靠 seq_len 变大捕获长时序, 但当前 seq_len 不可随 window 调 (待定是否修)。
+- **论文意图**: Hybrid 框架集成 VAE(跨传感器相关性) + LSTM/TF(时间依赖) 多异构 AE 互补, 故集成 AUC 高于单模。
