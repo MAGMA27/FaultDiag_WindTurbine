@@ -40,10 +40,11 @@ class VAE(nn.Module):
 
     @staticmethod
     def reparameterize(mu, logvar):
-        # ponytail: clamp logvar so std can't blow up to Inf mid-training;
-        # an unconstrained posterior sigma is what produced the 1e8 loss spikes.
-        # +/-10 -> std in [e^-5, e^5], well within float range.
+        # ponytail: clamp both logvar and mu. logvar clamp stops std->Inf (the 1e8
+        # spikes); mu clamp stops the posterior mean drifting to Inf under weak KL
+        # (beta small / long window) -> NaN mid-training. +/-10 keeps z in float range.
         logvar = torch.clamp(logvar, -10.0, 10.0)
+        mu = torch.clamp(mu, -10.0, 10.0)
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 

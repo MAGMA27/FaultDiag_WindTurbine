@@ -69,3 +69,34 @@ un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardiz
 - **论文对照**: Nair & Babu 2025 Sec.II.A 的滑动窗口特征工程默认输入为原始瞬时读数; CARE 混合了原始+预聚合列, 论文 pipeline 未考虑此混合。严格对齐论文应只对原始瞬时列做派生 (或仅用其 _avg)。但论文缺细节, 无法确认其实际处理。
 - **状态**: 暂不改默认 pipeline (改动 in_dim/checkpoint 成本高, 且非当前 AUC 差距主因; beta 才是)。记录为已知方法论问题。
 - **下一步验证 (未做)**: 加开关"跳过预聚合列 (仅保留其 _avg 作原始输入)"跑对照, 确认重复统计是否伤性能。另: 换 window 大小做快速验证 (见下)。
+
+### Phase 5 补充: window 大小快速验证 (2026-07-16)
+- 设置: vae_h256_l64_b0.1, cap=30000, epochs=30, Farm A, 仅改 --window。
+- 结果 (AUC 随 window 单调上升):
+  - window=12 (2h):  AUC=0.5242
+  - window=24 (4h):  AUC~0.62 (30ep 小cap近似; 全量80ep=0.629)
+  - window=48 (8h):  AUC=0.6220
+  - window=96 (16h): AUC=0.6731  (loss 101.8 未平台)
+- 结论: window 是强信号, 比 cap/epoch 影响更大。小窗口(2h)噪声主导最差; 长上下文(16h)浮现早期故障模式。window=96 仍未饱和, 可能继续涨。
+- 论文对照: 论文用 4h(24步)偏保守; 本数据更长窗口更优。
+- 下一步: 全量 (cap 150k) + window=96 + 200ep 验证天花板; 试 window=192/336 确认单调性。
+
+### Phase 5 补充: mu 爆炸修复 + window=96 全量结果 (2026-07-16)
+- **问题 (nan 崩溃)**: vae_h256_l64_b0.1 + window=96 + 200ep 在 ep40 起 loss=nan (全 nan, 评估 0 样本报错)。
+  - 根因: beta=0.1 KL 约束弱, encoder 的 posterior mean (mu) 在长窗口复杂特征下中后期漂移溢出 -> Inf/NaN。
+  - 之前的 logvar clamp 只防了 std 爆炸, 未防 mu 爆炸 (window=24 时 mu 未越界故不崩; window=96 更复杂更早越界)。
+  - 注意: 代码无 LR scheduler, 崩与学习率调度无关。
+- **修复**: src/faultdiagnose/models/vae.py 的 reparameterize 同时 clamp mu 到 [-10,10] (与 logvar 对称)。
+  - 机制: mu 越界样本/维度处梯度被截断为 0 (encoder fc_mu 该步不更新), 其余参数/样本梯度正常; decoder 用 clamp 后的 z 训练, 梯度全程有效。
+  - 代价: mu 被硬锁 ±10, 表达力略受限 (弱 KL 下的作弊通道被焊死); 更优雅做法是调大 beta 软约束, clamp 留作安全网。
+- **验证 (小 cap 30k, window=96)**:
+  - 修复前 200ep: ep40 起 nan (崩)
+  - 修复后 60ep:  loss 78.5,  AUC=0.6959 (不崩, 稳定)
+- **全量结果 (cap 150k, window=96, 200ep, beta=0.1)**:
+  - loss 62.8 (仍缓降未完全平台), AUC=0.7196
+  - 对比 window=24 全量 200ep AUC=0.632 -> +0.088。window 是比 cap/epoch 更强的信号。
+- **下一步 (未做)**:
+  - window=96 仍缓降, 可试 window=192/336 确认天花板; 或全量 200ep 已近饱和则停。
+  - latent 假设: 加 vae_h256_l128_b0.1 验证 64->128 是否继续涨 (window=96 更复杂可能 latent 偏小)。
+  - beta 软约束: 试 beta=0.3~0.5 看能否替代硬 clamp 且 AUC 更高。
+  - 跨风场: 论文 0.947 为 Farm B 集成, Farm A 单模论文表 0.823, 当前 0.72 仍有差距待追。
