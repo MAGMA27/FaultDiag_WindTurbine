@@ -35,7 +35,6 @@ MODELS_DIR = RESULTS / "checkpoints"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# 锟斤拷锟斤拷 data pipeline 锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷
 
 def collect_all(farms, window, seq_len, cap, use_fft=False):
     """Collect both VAE (flat) mats and LSTM (sequence) mats from normal data."""
@@ -132,7 +131,6 @@ def _make_labels(ev, times, n):
     return np.zeros(n, dtype=int)
 
 
-# 锟斤拷锟斤拷 training with per-epoch AUC 锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷
 
 def train_vae_gpu(model, X, epochs, batch_size, lr=1e-3, name="", loss_f=None):
     model.to(DEVICE)
@@ -189,7 +187,6 @@ def train_seq_gpu(model, zmats, seq_len, epochs, batch_size, lr=1e-3, name="", l
     return losses
 
 
-# 锟斤拷锟斤拷 hyperparameter configs 锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷
 
 CONFIGS = [
 {"name": "vae_h256_l32_b0.1",   "model": "vae",  "hidden": 256, "latent": 32,  "beta": 0.1,  "epochs": 80, "batch": 1024},
@@ -321,5 +318,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
