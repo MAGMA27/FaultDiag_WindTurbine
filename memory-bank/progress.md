@@ -30,15 +30,17 @@
 ## Phase 5 VAE 稳定性修复 + beta 调参 (2026-07-16)
 - **现象**: VAE 训练 loss 出现孤立 1e8 / 2e4 尖峰 (ep51 / ep70),AUC ~0.565 接近随机。
 - **根因 (数值爆炸)**: VAE.reparameterize 中 std = exp(0.5*logvar) 无上限,c_logvar 偶发漂到大正值 -> std->Inf -> 解码输出 Inf -> 单 batch MSE 爆掉。clip_grad_norm_ 只挡反向,挡不住前向 Inf,故仅污染一个 batch 即恢复。
-- **修复**: src/faultdiagnose/models/vae.py 的 eparameterize 内 clamp logvar 到 [-10, 10] (std in [e^-5, e^5])。尖峰消除。
-- **数据标准化确认**: un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardizer),非问题根因。
+- **修复**: src/faultdiagnose/models/vae.py 的 
+eparameterize 内 clamp logvar 到 [-10, 10] (std in [e^-5, e^5])。尖峰消除。
+- **数据标准化确认**: 
+un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardizer),非问题根因。
 - **beta ablation (同结构 vae_h256_l64, 80ep, Farm A, cap 150k)**:
   - beta=1.0: loss 152.4, AUC=0.607
   - beta=0.1: loss 91.9,  AUC=0.629  (KL 权重过高压垮重构, latent 趋塌缩, 异常分数区分度下降)
   - 结论: beta 是主因之一, 方向确认。beta=0.1 的 loss 仍持续下降 (ep80 未平台), 加 epoch 可能继续涨。
 - **下一步 (未做)**:
   - beta=0.1 加 epoch (200) 看天花板; 试 beta=0.01 确认单调性。
-  - 567 维特征中常数/低方差列被 std=1 保留为噪声, 稀释异常信号 -> 需丢弃低方差列再标准化 (改动面较大, 待定)。
+  - 567 维特征中常数/低方差列被 std=1 保留 (已否决裁剪: 准常数特征可能是区分错误状态的关键信号, 且论文未做此步, 复现需对齐 pipeline)。
   - 正负比 ~0.24% (2522/1053180), AUC 对少量正样本本就难拉高, 需确认标签/窗口逻辑。
 - **新增 config**: ae_h256_l64_b0.1 加入 scripts/run_gpu_tune.py CONFIGS, 用于严格 beta ablation。
 
@@ -51,8 +53,8 @@
   - 80ep:  loss 91.9,  AUC=0.629
   - 200ep: loss 81.5,  AUC=0.632
   - 注意: loss 从 91.9 -> 81.5 持续稳定下降, **未平台**, 模型仍在学。AUC 仅 +0.3 是因 AUC 对重构误差的整体单调改善不敏感, 不代表无收益或到天花板。
-  - 结论: 加 epoch 仍有稳定 (虽小) 提升, 性价比递减但未饱和。是否继续堆 epoch 取决于时间预算; 特征维度 (567 维低方差噪声列) 是另一个独立杠杆, 不互斥。
+  - 结论: 加 epoch 仍有稳定 (虽小) 提升, 性价比递减但未饱和。是否继续堆 epoch 取决于时间预算。
 - **下一步 (未做)**:
-  1. 567 维特征中常数/低方差列被 std=1 保留为噪声, 稀释异常信号 -> 丢弃低方差列再标准化 (改动面较大, 最可能提分)。
+  1. 保持特征工程与论文一致, 不裁剪低方差列 (准常数特征可能含错误状态信息; 论文未做此步, 复现须对齐)。
   2. 正负比 ~0.24% (2522/1053180), AUC 对少量正样本本就难拉高 -> 确认标签/窗口逻辑无误。
   3. 跨风场: 论文 0.947 是 Farm B 集成结果, 当前只在 Farm A 单模, 差距部分来自此。
