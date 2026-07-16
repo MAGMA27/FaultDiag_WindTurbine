@@ -111,3 +111,15 @@ un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardiz
 - **与语言模型区别**: 用户直觉的 decoder-only 自回归 (末 token -> 线性 -> 逐 token 生成) 是 GPT 式做法; 本检测 AE 是非自回归并行重建, 训练直接用整段 MSE, 无误差累积。
 - **对比口径注意**: seq 模型 seq_len 在 config 锁死 24, 不随 --window 变化; --window 只改 engineer_features 的滑动窗口统计, 不改模型自身时间步感受野。VAE window=96 变好部分来自特征统计窗口变大; LSTM/TF 本应靠 seq_len 变大捕获长时序, 但当前 seq_len 不可随 window 调 (待定是否修)。
 - **论文意图**: Hybrid 框架集成 VAE(跨传感器相关性) + LSTM/TF(时间依赖) 多异构 AE 互补, 故集成 AUC 高于单模。
+
+### Phase 5 补充: 时间连续性分块修复 (2026-07-16)
+- **问题 (用户发现)**: collect_all 用 operating_mask 过滤后, 不同段之间被删除的非 operating 行导致时间断裂, 但剩余行被当成连续矩阵, 导致:
+  1. rolling 窗口跨断点 (把 30 天前的结尾行和今天的开头行拼成连续窗口)
+  2. SeqWindowsDataset 跨断点滑窗 (序列模型学到虚假的时序连续性)
+- **量化**: Farm A 22 个 normal 数据集, 102 万 operating 行, 99.97% 连续 (10min 间隔); 但 >60min 断点 204 处, >360min (明确断裂) 97 处, 最大 gap 43,050min (~30 天)。
+  -> 约 1% 污染行, 评估/混合时影响不可忽略。
+- **修复 (最小方案)**: collect_all 内按时间连续性切段 (gap > 60min 算断), 段内独立 engineer_features/滑窗, 段间不跨。
+  实现: 过滤 operating 后, 按 time_stamp diff > 60min 的 cumsum 分组, 每组一段。VAE flat 和 LSTM/TF seq_mats 均按段 append。
+  段尾不足 window 的行被 dropna 自然丢弃 (无额外 mask)。
+  验证: 单 dataset 47k 行 -> 14 段 (原是 1 段), 段内最大 gap=30min (无泄漏)。
+- **影响**: 训练数据更干净, 全量数据中 204 处断点均正确处理; 评估/混合时异常分数不会被跨断点窗口污染。

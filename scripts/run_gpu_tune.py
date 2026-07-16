@@ -44,6 +44,19 @@ def collect_all(farms, window, seq_len, cap, use_fft=False):
         if r.event_label == "normal":
             normal_ids.setdefault(r.farm, []).append(str(r.event_id))
 
+    # ponytail: split each dataset into time-contiguous operating segments so that
+    # gaps (>BREAK_MIN between operating rows) are NOT treated as continuous.
+    # A 30-day停机 gap must not feed adjacent rows into one rolling window.
+    BREAK_MIN = 60.0
+
+    def _contiguous_segments(df_op):
+        df_op = df_op.copy()
+        df_op["_ts"] = pd.to_datetime(df_op["time_stamp"])
+        df_op = df_op.sort_values("_ts")
+        gap = df_op["_ts"].diff().dt.total_seconds() / 60.0
+        seg_id = (gap > BREAK_MIN).cumsum()
+        return [g for _, g in df_op.groupby(seg_id)]
+
     flat, seq_mats = [], []
     total = 0
     for farm in farms:
@@ -53,10 +66,15 @@ def collect_all(farms, window, seq_len, cap, use_fft=False):
                 df = df[df["train_test"] == "train"]
             df = df[operating_mask(df)]
             cols = select_feature_columns(df)
-            feats = engineer_features(df, window=window, columns=cols, use_fft=use_fft, fillna="ffill", clip_sigma=5.0).dropna()
-            X = feats.values.astype(np.float32)
-            flat.append(X)
-            total += len(X)
+            for seg in _contiguous_segments(df):
+                feats = engineer_features(seg, window=window, columns=cols, use_fft=use_fft, fillna="ffill", clip_sigma=5.0).dropna()
+                if len(feats) == 0:
+                    continue
+                X = feats.values.astype(np.float32)
+                flat.append(X)
+                total += len(X)
+                if total >= cap:
+                    break
             if total >= cap:
                 break
         if total >= cap:
@@ -195,13 +213,13 @@ CONFIGS = [
 {"name": "vae_h256_l64_b0.1",   "model": "vae",  "hidden": 256, "latent": 64,  "beta": 0.1,  "epochs": 80, "batch": 1024},
 {"name": "vae_h512_l64_b1.0",   "model": "vae",  "hidden": 512, "latent": 64,  "beta": 1.0,  "epochs": 80, "batch": 1024},
 {"name": "vae_h512_l128_b1.0",  "model": "vae",  "hidden": 512, "latent": 128, "beta": 1.0,  "epochs": 80, "batch": 1024},
-{"name": "lstm_h128_l64",       "model": "lstm", "hidden": 128, "latent": 64,  "epochs": 80, "batch": 512,  "seq_len": 24},
-{"name": "lstm_h256_l64",       "model": "lstm", "hidden": 256, "latent": 64,  "epochs": 80, "batch": 512,  "seq_len": 24},
-{"name": "lstm_h128_l128",      "model": "lstm", "hidden": 128, "latent": 128, "epochs": 80, "batch": 512,  "seq_len": 24},
-{"name": "lstm_h256_l128",      "model": "lstm", "hidden": 256, "latent": 128, "epochs": 80, "batch": 512,  "seq_len": 24},
-{"name": "tf_h128_l64",         "model": "transformer", "hidden": 128, "latent": 64,  "epochs": 80, "batch": 256,  "seq_len": 24},
-{"name": "tf_h256_l64",         "model": "transformer", "hidden": 256, "latent": 64,  "epochs": 80, "batch": 256,  "seq_len": 24},
-{"name": "tf_h128_l128",        "model": "transformer", "hidden": 128, "latent": 128, "epochs": 80, "batch": 256,  "seq_len": 24}
+{"name": "lstm_h128_l64",       "model": "lstm", "hidden": 128, "latent": 64,  "epochs": 80, "batch": 512,  "seq_len": 48},
+{"name": "lstm_h256_l64",       "model": "lstm", "hidden": 256, "latent": 64,  "epochs": 80, "batch": 512,  "seq_len": 48},
+{"name": "lstm_h128_l128",      "model": "lstm", "hidden": 128, "latent": 128, "epochs": 80, "batch": 512,  "seq_len": 48},
+{"name": "lstm_h256_l128",      "model": "lstm", "hidden": 256, "latent": 128, "epochs": 80, "batch": 512,  "seq_len": 48},
+{"name": "tf_h128_l64",         "model": "transformer", "hidden": 128, "latent": 64,  "epochs": 80, "batch": 256,  "seq_len": 48},
+{"name": "tf_h256_l64",         "model": "transformer", "hidden": 256, "latent": 64,  "epochs": 80, "batch": 256,  "seq_len": 48},
+{"name": "tf_h128_l128",        "model": "transformer", "hidden": 128, "latent": 128, "epochs": 80, "batch": 256,  "seq_len": 48}
 
 ]
 
@@ -230,13 +248,13 @@ def run_config(cfg, farms, window, cap, use_fft, label_mode="operating", loss_f=
     elif cfg["model"] == "lstm":
         model = LSTMAE(in_dim, seq_len, latent=cfg["latent"], hidden=cfg["hidden"], num_layers=2)
         train_seq_gpu(model, zmats, seq_len, epochs=epochs, batch_size=cfg["batch"], name=name, loss_f=loss_f)
-        scores, labels = evaluate_seq(model, farms, window, seq_len, mean, std, ev_map, use_fft, label_mode)
+        scores, labels = evaluate_seq(model, farms, window, seq_len, mean, std, ev_map, use_fft, label_mode=label_mode)
     else:  # transformer
         nhead = 4 if cfg["hidden"] <= 128 else 8
         model = TransformerAE(in_dim, seq_len, latent=cfg["latent"],
                               d_model=cfg["hidden"], nhead=nhead, num_layers=2)
         train_seq_gpu(model, zmats, seq_len, epochs=epochs, batch_size=cfg["batch"], name=name, loss_f=loss_f)
-        scores, labels = evaluate_seq(model, farms, window, seq_len, mean, std, ev_map, use_fft, label_mode)
+        scores, labels = evaluate_seq(model, farms, window, seq_len, mean, std, ev_map, use_fft, label_mode=label_mode)
 
     elapsed = time.time() - t0
     finite = np.isfinite(scores)
@@ -318,4 +336,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
