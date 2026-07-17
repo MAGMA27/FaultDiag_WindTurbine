@@ -23,14 +23,18 @@ class VAE(nn.Module):
         self.alpha = alpha
         self.beta = beta
         self.encoder = nn.Sequential(
-            nn.Linear(in_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
         )
         self.fc_mu = nn.Linear(hidden, latent)
         self.fc_logvar = nn.Linear(hidden, latent)
         self.decoder = nn.Sequential(
-            nn.Linear(latent, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(latent, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
             nn.Linear(hidden, in_dim),
         )
 
@@ -39,21 +43,22 @@ class VAE(nn.Module):
         return self.fc_mu(h), self.fc_logvar(h)
 
     @staticmethod
-    def reparameterize(mu, logvar):
-        # ponytail: clamp both logvar and mu. logvar clamp stops std->Inf (the 1e8
-        # spikes); mu clamp stops the posterior mean drifting to Inf under weak KL
-        # (beta small / long window) -> NaN mid-training. +/-10 keeps z in float range.
-        logvar = torch.clamp(logvar, -10.0, 10.0)
+    def reparameterize(mu, logvar, sample: bool = True):
+        # ponytail: clamp both mu and logvar. logvar upper bound was too loose
+        # (10 -> std=exp(5)~148 -> z up to ~454 -> decoder overflow -> loss spike).
+        # Tightened to logvar[-5,3] -> std[0.082,4.48] -> z ~ [-10,~23];
+        # mu clamp +-10 keeps posterior mean bounded. Full window=96 + 300ep stable.
+        logvar = torch.clamp(logvar, -5.0, 3.0)
         mu = torch.clamp(mu, -10.0, 10.0)
         std = torch.exp(0.5 * logvar)
-        return mu + torch.randn_like(std) * std
+        return mu + torch.randn_like(std) * std if sample else mu
 
     def decode(self, z):
         return self.decoder(z)
 
     def forward(self, x):
         mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
+        z = self.reparameterize(mu, logvar, sample=self.training)
         return self.decode(z), mu, logvar
 
     def loss(self, x, recon, mu, logvar):
@@ -66,7 +71,5 @@ class VAE(nn.Module):
         self.eval()
         recon, mu, logvar = self(x)
         per_sample_recon = ((recon - x) ** 2).sum(dim=1)
-        per_sample_kld = -0.5 * torch.sum(
-            1 + logvar - mu.pow(2) - logvar.exp(), dim=1
-        )
+        per_sample_kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         return self.alpha * per_sample_recon + self.beta * per_sample_kld

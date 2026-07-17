@@ -17,6 +17,27 @@ uv sync                 # 创建 .venv 并安装依赖（torch 为 CPU 版）
 uv run python -c "import torch; print(torch.__version__)"
 ```
 
+## GPU 正式实验
+
+实验参数统一放在 `configs/`。例如 Farm A 的全量 LSTM 实验：
+
+```bash
+uv run python scripts/run_gpu_tune.py --config configs/farm_a_lstm_h256_l64_w48_full.json
+```
+
+结果 JSON 会保留完整实验配置、随机种子、验证集早停信息和 cuDNN 运行策略。
+
+## PCA 基线与 CARE 冒烟验证
+
+PCA 重构误差基线与深度模型使用相同的数据切分、验证期阈值校准和 CARE 事件级报表。先用一个异常与一个正常序列检查整个流程：
+
+```bash
+uv run python scripts/run_pca_baseline.py --farms A --datasets 0,3 \
+  --cap-train 10000 --window 24 --no-fft --variance 0.95
+```
+
+正式比较时去掉 `--datasets`，并使用固定的全量训练配置。结果写入 `results/`，包括 CARE 指标 JSON、逐事件告警 CSV 和月度误报 CSV。
+
 数据集需另行下载并解压到 `CARE_To_Compare/`（已被 `.gitignore` 忽略，不入库）。
 
 ## 目录结构

@@ -11,11 +11,11 @@
 本仓库用 `uv` 管理依赖与虚拟环境，**不要**用 `pip install` 直接装包。
 
 - 同步环境: `uv sync`
-- 加依赖: `uv add <pkg>`（torch 走 CPU 源，见 `pyproject.toml` 的 `[tool.uv.sources]`，无需手动指定 index）
+- 加依赖: `uv add <pkg>`（torch 走 CUDA 源 `pytorch-cu124`，见 `pyproject.toml` 的 `[tool.uv.sources]`，无需手动指定 index）
 - 运行脚本: `uv run python <script>.py`
 - 跑测试: `uv run pytest`
 
-Python 固定 `>=3.13.9,<3.14`；torch 默认安装 CPU 版（`2.13.0+cpu`）。如需 GPU，改 `pyproject.toml` 的 `[tool.uv.sources]` 去掉 torch 的 CPU index 后重新 `uv sync`。
+Python 固定 `>=3.13.9,<3.14`；torch 默认安装 CUDA 版（`+cu124`，当前 `.venv` 内为 `2.6.0+cu124`），`uv run` 开箱即用 GPU。如需退回纯 CPU，改 `pyproject.toml` 的 `[tool.uv.sources]` 把 torch 指向 CPU index 后重新 `uv sync`。
 
 # 代码风格 (Code Style)
 
@@ -58,3 +58,5 @@ Python 固定 `>=3.13.9,<3.14`；torch 默认安装 CPU 版（`2.13.0+cpu`）。
 
 - 仅使用公开 CARE 数据集；无密钥、无外部凭证
 - 不在代码中硬编码他人机器路径
+
+

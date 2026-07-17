@@ -1,4 +1,11 @@
-﻿from .anomaly import compute_auc
+from .anomaly import compute_auc
+from .care import (
+    CareEvaluation,
+    build_event_eligibility_report,
+    criticality,
+    evaluate_care,
+    write_care_artifacts,
+)
 from .ensemble import (
     adaptive_threshold,
     combine,
@@ -11,6 +18,11 @@ from .ensemble import (
 
 __all__ = [
     "compute_auc",
+    "CareEvaluation",
+    "build_event_eligibility_report",
+    "criticality",
+    "evaluate_care",
+    "write_care_artifacts",
     "normalize",
     "validation_weights",
     "combine",

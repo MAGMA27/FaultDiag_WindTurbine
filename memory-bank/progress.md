@@ -123,3 +123,104 @@ un_gpu_tune.py 的 collect_all 已做 z-score (it_standardizer/pply_standardiz
   段尾不足 window 的行被 dropna 自然丢弃 (无额外 mask)。
   验证: 单 dataset 47k 行 -> 14 段 (原是 1 段), 段内最大 gap=30min (无泄漏)。
 - **影响**: 训练数据更干净, 全量数据中 204 处断点均正确处理; 评估/混合时异常分数不会被跨断点窗口污染。
+
+### 训练运行策略 (2026-07-17)
+- **吞吐优先**: 固定 Python / NumPy / PyTorch 随机种子以便大致复现，但启用
+  `torch.backends.cudnn.benchmark=True`，并允许 cuDNN 选择最快实现；接受少量跨次结果差异，
+  不追求 bit-exact determinism。每个结果 JSON 记录 seed、完整实验配置及 benchmark 状态。
+- **配置化运行**: `scripts/run_gpu_tune.py --config <json>` 从 `configs/` 读取同一实验的运行参数
+  和模型参数，避免正式训练依赖手写长命令。
+- **冻结测试协议**: 最终 AUC 仅在每个数据集的 `train_test == "prediction"` 分区上计算；
+  训练与验证只使用 normal event 的 `train` 分区。随后才筛选 operating state 并按时间缺口分段。
+
+### 项目路线重定向：CARE 事件级预警评估 (2026-07-17)
+- **决策**：不再将 Farm A point-wise AUC 用作继续调参或作品集主结论。先冻结 prediction-only、
+  状态筛选、时间连续性与验证期阈值校准的协议，再实施 CARE score。
+- **历史结果口径**：已多次查看 Farm A prediction AUC 的 beta/window/latent 实验全部归为开发期结果；
+  锁定规则后以未参与选择的 Farm B/C 做一次性外部评估，Farm A 必须标为 development/audited。
+- **主交付指标**：CARE 四个子分数（Coverage、Accuracy、Reliability、Earliness）及最终 CARE；
+  同时报出逐事件报警时间线、24/48h 覆盖率、每月误报次数。AUC-ROC 降级为辅助诊断。
+- **模型优先级**：PCA+Isolation Forest、工况条件残差、一个强时序 AE、最后才是 VAE/LSTM/Transformer
+  集成。加入传感器贡献排序与趋势案例，但项目称为早期异常预警而非故障诊断。
+
+### CARE score 与事件报表实现 (2026-07-17)
+- 新增 `src/faultdiagnose/evaluation/care.py`：Coverage（事件平均 F0.5）、Accuracy、Reliability
+  （CARE criticality Algorithm 1，默认阈值 72）、Earliness 以及 CARE 的两个特例均已实现。
+- `evaluate_care()` 强制传入 `train_test` 并只接受 prediction 分区；输入保留全状态行以便 criticality 在
+  非正常状态时按论文规则保持计数，而点级子分数仍只统计 status 0/2。
+- 交付 `CareEvaluation`：标量指标、逐异常事件告警表（首次告警、criticality 告警、lead time、24/48h
+  覆盖）与正常数据集的月度误报告警 episode/point 统计；`write_care_artifacts()` 写入 JSON/CSV。
+- 验证：新增 `tests/test_care.py`，覆盖 criticality、Earliness、prediction-only、防止低 Accuracy 掩盖
+  其他分数、事件/月度报表与文件写出；全量 `pytest` 33 passed。
+
+### 正式 runner 接入 CARE 评估 (2026-07-17)
+- `scripts/run_gpu_tune.py` 现在为每个模型保留完整 prediction 状态时间线；仅对 status 0/2 生成模型
+  分数，其他状态显式标为无告警，以符合点级打分过滤和 CARE criticality 状态保持两种要求。
+- 阈值由正常验证重构误差的 `--threshold-percentile` 校准（限制为 95--99，正式配置固定 99），不读取
+  prediction 标签；每个结果 JSON 记录阈值和来源。
+- runner 自动调用 `evaluate_care()`，在 `results/` 写入 `<stamp>_<model>_care_metrics.json`、
+  `_events.csv` 和 `_monthly_false_alarms.csv`，同时把路径与 CARE 标量写入主结果 JSON。
+- `--label-mode full` 已拒绝，防止重新把停机/维护行混入点级评估；新增 runner helper 回归测试。
+
+### PCA 重构误差基线与流程冒烟验证 (2026-07-17)
+- 新增 `scripts/run_pca_baseline.py`：以训练期 normal 数据拟合标准化与 PCA（默认保留 99% 方差），
+  取验证期正常重构误差的 99 分位为阈值，并复用 prediction-only + CARE artifacts 流程。
+- 支持 `--datasets` 调试子集；若状态筛选后子集只剩一个点级标签类别，AUC 显式写为 `null`，而不是误导性
+  `NaN`，CARE 仍可照常评估。
+- 冒烟运行：Farm A datasets `0,3`、10k 训练点、window 24、无 FFT、PCA 95% 方差，得到 156 个主成分、
+  阈值 0.279458、CARE 0.3931；AUC 未定义，因为异常 dataset 0 的标注事件在运行状态筛选后无正类点。
+  输出：`results/20260717_1600_pca_result.json` 及对应 CARE JSON/CSV。
+
+### Farm A 全量 PCA 基线 (2026-07-17)
+- 设置：全部 22 条 Farm A 序列；30k 正常训练点 / 4,504 验证点；window 24、FFT 开启、PCA 保留 99%
+  方差（267 个主成分）、验证误差 P99 阈值 0.098342。
+- 结果：AUC-ROC 0.7174，CARE 0.4011；Coverage 0.0157、Earliness 0.0042、Reliability 0、
+  Accuracy 0.9929。正常序列累计 50 个误报 episode / 205 个误报点。
+- 事件审计：12 个 anomaly datasets 中仅 event 40 在标注事件窗内仍有 status 0/2 点（2,522 个）；其余
+  11 个事件均为 0。因此 AUC 只反映 event 40 的 2,522 个正类点；PCA 仅在该事件窗出现一次点级报警，
+  max criticality=33，未达到 72，故没有任何可信事件级报警。
+- 结论：此结果是深度时序模型必须击败的低复杂度基线；同时确认 Farm A 在严格运行状态协议下无法把 12 个
+  标注事件都当作点级检测样本，正式报告必须明确事件可评分性分层。
+- 输出：`results/20260717_1617_pca_result.json` 及同名 CARE JSON/CSV。
+
+### 全风场事件可评分性审计 (2026-07-17)
+- 新增 `build_event_eligibility_report()` 与 `scripts/audit_event_eligibility.py`；每次 CARE artifact 也会
+  自动写出 `*_event_eligibility.csv`。字段包括事件窗 prediction 行数、status 0/2 行数、占比和
+  `pointwise_eligible`。
+- 全量审计结果：Farm A 12 个异常事件中仅 1 个点级可评分（8.3%，2,522 / 18,240 事件窗点）；Farm B 为
+  6 / 6（32,088 / 33,989，94.4%）；Farm C 为 27 / 27（48,157 / 60,897，79.1%）。
+- 结论：Farm A 应以 event-level Reliability / 正常误报为主，并将 AUC/Coverage/Earliness 明确限制为
+  event 40；Farm B/C 才适合作为点级早期预警比较的主战场。
+- 输出：`results/20260717_1634_event_eligibility.csv` 与
+  `results/20260717_1634_event_eligibility_summary.json`。
+
+### Farm B PCA 流式切分的初始运行（已废弃，2026-07-17）
+- 资源修复：Farm B 的 252 个原始特征经过窗口工程后为 1,764 维，常驻进程在连续评分宽表时内存累积。
+  `run_pca_baseline.py` 改为带 lookback 的流式 feature chunks（默认 2,000 行），保持每个时刻的窗口输入
+  不变；PCA 使用 `covariance_eigh` 降低 tall matrix 的分解峰值内存。加入可选的隔离/随机 PCA 调试参数，
+  但正式结果未使用它们。
+- **废弃原因**：这一版将每个 2,000 行 feature chunk 的末尾 15% 当作验证集，而不是将每个完整的连续
+  时间段末尾 15% 当作验证集。它改变了原先冻结的时序验证协议，不能作为正式比较结果。
+- 设置：全部 15 条 Farm B 序列；25,474 训练点 / 4,526 验证点；window 24、FFT 开启、PCA 99% 方差
+  （582 components）、验证误差 P99 阈值 0.111502。
+- 结果：AUC-ROC 0.5746；Coverage 0.8176、Earliness 0.6686、Reliability 0.4545，但 Accuracy 仅
+  0.3172。由于 Accuracy < 0.5，CARE 特例使最终 CARE=0.3172。
+- 事件/运维解释：6/6 异常事件均达 criticality 72 且均有 24/48h 提前报警；但正常序列产生 309 个误报
+  episode、21,218 个误报点。因此 PCA 目前极度过敏，不能作为可用告警器；阈值校准/工况变化是后续重点。
+- 输出：`results/20260717_1937_pca_result.json` 及同名 CARE metrics/events/event eligibility/monthly false
+  alarms artifacts；后台完整运行日志为 `results/farm_b_pca_20260717.log`。
+
+### Farm B 全量 PCA 基线（修正连续段验证切分，2026-07-17）
+- 修正：新增 `split_chunked_matrices()`；流式 chunk 仅用于限制内存，每个完整连续段仍按时间顺序保留
+  最后 15% 为 validation。训练/验证不再在每个 2,000 行 chunk 内重复切分。新增回归测试确保长度为 10 的
+  连续段被切成前 8 行训练、后 2 行验证。
+- 设置：全部 15 条 Farm B 序列；25,475 训练点 / 4,525 验证点；window 24、FFT 开启、PCA 保留 99%
+  方差（581 components）、验证误差 P99 阈值 0.112497。
+- 结果：AUC-ROC 0.5747；Coverage 0.8160、Earliness 0.6670、Reliability 0.4545、Accuracy 0.3186，
+  因 Accuracy < 0.5，CARE 特例使最终 CARE=0.3186。与废弃运行的数值接近，但此版本才符合冻结协议。
+- 事件/误报：6/6 异常事件均达到 criticality 72、均有 24/48h 覆盖；正常数据中仍有 315 个误报 episode、
+  21,178 个误报点（2023-09 最多：132 episode / 6,333 points）。因此 PCA 仍明显过敏，结论不变。
+- 输出：`results/20260717_1951_pca_result.json` 及同名 CARE metrics/events/event eligibility/monthly false
+  alarms artifacts；重跑日志为 `results/farm_b_pca_20260717_rerun.log`。
+- 验证：新增连续段尾部切分回归测试；全量 `uv run pytest` 为 41 passed。PCA 脚本与其测试的 ruff 检查通过；
+  仓库整体仍有 33 个与本改动无关的既有 ruff 问题，未在此次协议修正中改动。
