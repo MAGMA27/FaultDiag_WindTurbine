@@ -4,10 +4,14 @@ import pandas as pd
 from faultdiagnose.evaluation.ensemble import (
     adaptive_threshold,
     combine,
+    combine_standardized,
     early_detection_report,
     flag,
     lead_time_hours,
     normalize,
+    robust_location_scale,
+    robust_standardize,
+    validation_stability_weights,
     validation_weights,
 )
 
@@ -17,6 +21,30 @@ def test_normalize_clips():
     n = normalize(s, 0.0, 10.0)
     assert np.allclose(n, [0.0, 0.5, 1.0, 1.0])
     assert normalize(s, 5.0, 5.0).sum() == 0.0
+
+
+def test_robust_standardize_uses_validation_iqr():
+    scores = np.array([1.0, 2.0, 3.0, 100.0])
+    median, scale = robust_location_scale(scores)
+
+    standardized = robust_standardize(np.array([median, median + scale]), median, scale)
+
+    assert scale > 0
+    assert np.allclose(standardized, [0.0, 1.0])
+
+
+def test_validation_stability_weights_ignore_nonfinite_and_normalize():
+    weights = validation_stability_weights(
+        {
+            "stable": np.array([0.9, 1.0, 1.1, 1.2]),
+            "wide": np.array([0.0, 10.0, 20.0, 30.0]),
+            "bad": np.array([np.nan, np.inf]),
+        }
+    )
+
+    assert weights["stable"] > weights["wide"]
+    assert weights["bad"] == 0.0
+    assert abs(sum(weights.values()) - 1.0) < 1e-9
 
 
 def test_validation_weights_excess_over_half():
@@ -35,6 +63,16 @@ def test_combine_monotonic():
     norm = {"a": (0.0, 1.0), "b": (0.0, 1.0)}
     w = {"a": 1.0, "b": 0.0}
     out = combine(per, w, norm)
+    assert np.allclose(out, [0.0, 1.0])
+
+
+def test_combine_standardized_weighted_average():
+    per = {"a": np.array([1.0, 2.0]), "b": np.array([10.0, 20.0])}
+    norm = {"a": (1.0, 1.0), "b": (10.0, 10.0)}
+    weights = {"a": 0.5, "b": 0.5}
+
+    out = combine_standardized(per, weights, norm)
+
     assert np.allclose(out, [0.0, 1.0])
 
 

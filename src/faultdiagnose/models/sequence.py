@@ -55,24 +55,99 @@ class LSTMAE(nn.Module):
         hidden: int = 64,
         num_layers: int = 1,
         dropout: float = 0.0,
+        decoder_init: str = "state",
+        decoder_positional: str = "learned",
+        loss_type: str = "mse",
+        architecture: str = "symmetric",
     ):
         super().__init__()
+        if decoder_init not in {"zero", "state"}:
+            raise ValueError("decoder_init must be 'zero' or 'state'")
+        if decoder_positional not in {"none", "learned"}:
+            raise ValueError("decoder_positional must be 'none' or 'learned'")
+        if loss_type not in {"mse", "mae"}:
+            raise ValueError("loss_type must be 'mse' or 'mae'")
+        if architecture not in {"symmetric", "paper", "direct"}:
+            raise ValueError("architecture must be 'symmetric', 'paper', or 'direct'")
+        if architecture == "paper" and num_layers != 2:
+            raise ValueError("paper architecture requires num_layers=2")
+        if architecture == "direct" and latent != hidden:
+            raise ValueError("direct architecture requires latent=hidden")
         self.seq_len = seq_len
-        self.encoder = nn.LSTM(in_dim, hidden, num_layers, batch_first=True, dropout=dropout)
-        self.to_latent = nn.Linear(hidden, latent)
-        self.dec_rnn = nn.LSTM(latent, hidden, num_layers, batch_first=True, dropout=dropout)
+        self.decoder_init = decoder_init
+        self.decoder_positional = decoder_positional
+        self.loss_type = loss_type
+        self.architecture = architecture
+        if architecture in {"symmetric", "direct"}:
+            self.encoder = nn.LSTM(in_dim, hidden, num_layers, batch_first=True, dropout=dropout)
+            self.to_latent = (
+                nn.Identity() if architecture == "direct" else nn.Linear(hidden, latent)
+            )
+            self.dec_rnn = nn.LSTM(latent, hidden, num_layers, batch_first=True, dropout=dropout)
+            if decoder_init == "state":
+                self.latent_to_h = nn.Linear(latent, num_layers * hidden)
+                self.latent_to_c = nn.Linear(latent, num_layers * hidden)
+        else:
+            # Reference architecture: encoder [hidden -> latent], decoder [latent -> hidden].
+            self.enc_first = nn.LSTM(in_dim, hidden, 1, batch_first=True)
+            self.enc_second = nn.LSTM(hidden, latent, 1, batch_first=True)
+            self.to_latent = nn.Identity()
+            self.dec_first = nn.LSTM(latent, latent, 1, batch_first=True)
+            self.dec_second = nn.LSTM(latent, hidden, 1, batch_first=True)
+            if decoder_init == "state":
+                self.latent_to_enc_h = nn.Linear(latent, latent)
+                self.latent_to_enc_c = nn.Linear(latent, latent)
+                self.latent_to_dec1_h = nn.Linear(latent, latent)
+                self.latent_to_dec1_c = nn.Linear(latent, latent)
+                self.latent_to_dec2_h = nn.Linear(latent, hidden)
+                self.latent_to_dec2_c = nn.Linear(latent, hidden)
+        if decoder_positional == "learned":
+            self.decoder_pos = nn.Parameter(torch.zeros(1, seq_len, latent))
+            nn.init.normal_(self.decoder_pos, mean=0.0, std=0.02)
         self.out = nn.Linear(hidden, in_dim)
 
     def forward(self, x):
         # x: [B, T, D]
-        _, (h, _) = self.encoder(x)
-        z = self.to_latent(h[-1])  # [B, latent]
+        if self.architecture in {"symmetric", "direct"}:
+            _, (h, _) = self.encoder(x)
+            z = self.to_latent(h[-1])  # [B, latent]
+        else:
+            encoded, _ = self.enc_first(x)
+            _, (h, _) = self.enc_second(encoded)
+            z = self.to_latent(h[-1])  # [B, latent]
         dec_in = z.unsqueeze(1).repeat(1, self.seq_len, 1)  # [B, T, latent]
-        d, _ = self.dec_rnn(dec_in)
+        if self.decoder_positional == "learned":
+            dec_in = dec_in + self.decoder_pos
+        if self.architecture in {"symmetric", "direct"}:
+            if self.decoder_init == "state":
+                batch_size = z.shape[0]
+                h0 = self.latent_to_h(z).view(
+                    batch_size, self.dec_rnn.num_layers, -1
+                ).transpose(0, 1)
+                c0 = self.latent_to_c(z).view(
+                    batch_size, self.dec_rnn.num_layers, -1
+                ).transpose(0, 1)
+                d, _ = self.dec_rnn(dec_in, (h0.contiguous(), c0.contiguous()))
+            else:
+                d, _ = self.dec_rnn(dec_in)
+        else:
+            if self.decoder_init == "state":
+                h1 = self.latent_to_dec1_h(z).unsqueeze(0)
+                c1 = self.latent_to_dec1_c(z).unsqueeze(0)
+                d1, _ = self.dec_first(dec_in, (h1, c1))
+                h2 = self.latent_to_dec2_h(z).unsqueeze(0)
+                c2 = self.latent_to_dec2_c(z).unsqueeze(0)
+                d, _ = self.dec_second(d1, (h2, c2))
+            else:
+                d1, _ = self.dec_first(dec_in)
+                d, _ = self.dec_second(d1)
         return self.out(d), z
 
     def loss(self, x, recon):
-        return ((recon - x) ** 2).mean()
+        error = recon - x
+        if self.loss_type == "mae":
+            return error.abs().mean()
+        return error.square().mean()
 
     @torch.no_grad()
     def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:

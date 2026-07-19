@@ -100,7 +100,35 @@ def split_train_validation(
     return train_mats, val_mats
 
 
-def collect_all(farms, window, cap, validation_fraction, use_fft=False):
+def _feature_columns(
+    frame: pd.DataFrame,
+    farm: str,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Return configured feature columns for a farm, or fall back to all sensor columns."""
+    if feature_columns_by_farm is None or farm not in feature_columns_by_farm:
+        return select_feature_columns(frame)
+    columns = feature_columns_by_farm[farm]
+    if columns == ["__avg_only__"]:
+        return [
+            column
+            for column in select_feature_columns(frame)
+            if column.endswith("_avg")
+        ]
+    missing = sorted(set(columns).difference(frame.columns))
+    if missing:
+        raise ValueError(f"Farm {farm} is missing configured feature columns: {missing}")
+    return columns
+
+
+def collect_all(
+    farms,
+    window,
+    cap,
+    validation_fraction,
+    use_fft=False,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+):
     """Collect both VAE (flat) mats and LSTM (sequence) mats from normal data."""
     events = load_events(OUT)
     normal_ids: dict[str, list[str]] = {}
@@ -116,7 +144,7 @@ def collect_all(farms, window, cap, validation_fraction, use_fft=False):
             if "train_test" in df.columns:
                 df = df[df["train_test"] == "train"]
             df = df[operating_mask(df)]
-            cols = select_feature_columns(df)
+            cols = _feature_columns(df, farm, feature_columns_by_farm)
             for seg in contiguous_segments(df):
                 feats = engineer_features(
                     seg,
@@ -158,7 +186,17 @@ def _empty_prediction_records(df: pd.DataFrame, farm: str, dataset_id: str) -> p
     return records
 
 
-def evaluate_vae_records(model, farms, window, mean, std, use_fft=False):
+def evaluate_vae_records(
+    model,
+    farms,
+    window,
+    mean,
+    std,
+    use_fft=False,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+    score_reduction: str = "sum",
+    include_kld: bool = True,
+):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
     for farm in farms:
@@ -167,7 +205,7 @@ def evaluate_vae_records(model, farms, window, mean, std, use_fft=False):
             records = _empty_prediction_records(raw_df, farm, did)
             score_df = prediction_rows(raw_df)
             score_df = score_df[operating_mask(score_df)]
-            cols = select_feature_columns(score_df)
+            cols = _feature_columns(score_df, farm, feature_columns_by_farm)
             for segment in contiguous_segments(score_df):
                 feats = engineer_features(
                     segment,
@@ -182,7 +220,13 @@ def evaluate_vae_records(model, farms, window, mean, std, use_fft=False):
                 Z = apply_standardizer(feats, mean, std).astype(np.float32)
                 with torch.inference_mode():
                     scores = (
-                        model.reconstruction_error(torch.from_numpy(Z).to(DEVICE)).cpu().numpy()
+                        model.reconstruction_error(
+                            torch.from_numpy(Z).to(DEVICE),
+                            reduction=score_reduction,
+                            include_kld=include_kld,
+                        )
+                        .cpu()
+                        .numpy()
                     )
                 records.loc[feats.index, "score"] = scores
             records_list.append(records)
@@ -198,6 +242,7 @@ def evaluate_seq_records(
     std,
     use_fft=False,
     batch=4096,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
 ):
     """Score sequence windows and retain the complete prediction status timeline."""
     records_list = []
@@ -207,7 +252,7 @@ def evaluate_seq_records(
             records = _empty_prediction_records(raw_df, farm, did)
             score_df = prediction_rows(raw_df)
             score_df = score_df[operating_mask(score_df)]
-            cols = select_feature_columns(score_df)
+            cols = _feature_columns(score_df, farm, feature_columns_by_farm)
             for segment in contiguous_segments(score_df):
                 feats = engineer_features(
                     segment,
@@ -237,14 +282,26 @@ def evaluate_seq_records(
     return pd.concat(records_list, ignore_index=True)
 
 
-def validation_scores_vae(model, X_val: np.ndarray, batch_size: int) -> np.ndarray:
+def validation_scores_vae(
+    model,
+    X_val: np.ndarray,
+    batch_size: int,
+    score_reduction: str = "sum",
+    include_kld: bool = True,
+) -> np.ndarray:
     """Return validation reconstruction errors used to calibrate an unsupervised threshold."""
     loader = DataLoader(torch.from_numpy(X_val).float(), batch_size=batch_size, shuffle=False)
     errors = []
     with torch.inference_mode():
         for xb in loader:
             errors.append(
-                model.reconstruction_error(xb.to(DEVICE, non_blocking=True)).cpu().numpy()
+                model.reconstruction_error(
+                    xb.to(DEVICE, non_blocking=True),
+                    reduction=score_reduction,
+                    include_kld=include_kld,
+                )
+                .cpu()
+                .numpy()
             )
     return np.concatenate(errors)
 
@@ -281,10 +338,35 @@ def _records_to_auc_arrays(records: pd.DataFrame, ev_map: dict) -> tuple[np.ndar
 
 
 def train_vae_gpu(
-    model, X, X_val, epochs, batch_size, patience, min_delta, lr=1e-3, name="", loss_f=None
+    model,
+    X,
+    X_val,
+    epochs,
+    batch_size,
+    patience,
+    min_delta,
+    lr=1e-3,
+    scheduler: str = "none",
+    warmup_epochs: int = 0,
+    min_lr: float = 1e-5,
+    kl_anneal_epochs: int = 0,
+    name="",
+    loss_f=None,
 ):
     model.to(DEVICE)
+    target_beta = float(getattr(model, "beta", 1.0))
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    plateau = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=0.5,
+            patience=10,
+            min_lr=min_lr,
+        )
+        if scheduler == "plateau"
+        else None
+    )
     dl = DataLoader(
         torch.from_numpy(X).float(), batch_size=batch_size, shuffle=True, pin_memory=True
     )
@@ -294,18 +376,44 @@ def train_vae_gpu(
     losses = []
     best_state, best_val_loss, best_epoch, stale_epochs = None, float("inf"), 0, 0
     for ep in range(epochs):
+        if kl_anneal_epochs > 0:
+            model.beta = target_beta * min(1.0, float(ep + 1) / float(kl_anneal_epochs))
+        else:
+            model.beta = target_beta
+        if scheduler == "warmup_cosine":
+            if warmup_epochs > 0 and ep < warmup_epochs:
+                current_lr = lr * float(ep + 1) / float(warmup_epochs)
+            else:
+                denom = max(1, epochs - max(0, warmup_epochs))
+                progress = (ep - max(0, warmup_epochs)) / denom
+                cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, max(0.0, progress))))
+                current_lr = min_lr + (lr - min_lr) * cosine
+            for group in opt.param_groups:
+                group["lr"] = current_lr
         model.train()
-        tot, n = 0.0, 0
+        tot, n, skipped = 0.0, 0, 0
         for xb in dl:
             xb = xb.to(DEVICE, non_blocking=True)
             opt.zero_grad()
             recon, mu, logvar = model(xb)
             loss, _, _ = model.loss(xb, recon, mu, logvar)
+            if not torch.isfinite(loss):
+                skipped += 1
+                continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), 1.0, error_if_nonfinite=False
+            )
+            if not torch.isfinite(grad_norm):
+                opt.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
             opt.step()
             tot += loss.item()
             n += 1
+        if n == 0:
+            print(f"  stop at ep {ep + 1}; all VAE batches had non-finite loss/grad")
+            break
         losses.append(tot / n)
         model.eval()
         val_total, val_batches = 0.0, 0
@@ -314,9 +422,16 @@ def train_vae_gpu(
                 xb = xb.to(DEVICE, non_blocking=True)
                 recon, mu, logvar = model(xb)
                 val_loss, _, _ = model.loss(xb, recon, mu, logvar)
+                if not torch.isfinite(val_loss):
+                    val_total = float("nan")
+                    val_batches = 1
+                    break
                 val_total += val_loss.item()
                 val_batches += 1
         current_val_loss = val_total / val_batches
+        if not np.isfinite(current_val_loss):
+            print(f"  stop at ep {ep + 1}; validation loss became non-finite")
+            break
         if current_val_loss < best_val_loss - min_delta:
             best_state = {
                 key: value.detach().cpu().clone() for key, value in model.state_dict().items()
@@ -324,16 +439,27 @@ def train_vae_gpu(
             best_val_loss, best_epoch, stale_epochs = current_val_loss, ep + 1, 0
         else:
             stale_epochs += 1
+        if plateau is not None:
+            plateau.step(current_val_loss)
+        current_lr = float(opt.param_groups[0]["lr"])
         if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"  ep {ep + 1}/{epochs} loss={losses[-1]:.4f} val={current_val_loss:.4f}")
+            print(
+                f"  ep {ep + 1}/{epochs} loss={losses[-1]:.4f} "
+                f"val={current_val_loss:.4f} lr={current_lr:.2e} "
+                f"beta={model.beta:.4g} skipped={skipped}"
+            )
         if loss_f is not None:
             loss_f.write(
-                f"name={name} ep={ep + 1} loss={losses[-1]:.6f} val={current_val_loss:.6f}\n"
+                f"name={name} ep={ep + 1} loss={losses[-1]:.6f} "
+                f"val={current_val_loss:.6f} lr={current_lr:.8g} "
+                f"beta={model.beta:.8g} skipped={skipped}\n"
             )
             loss_f.flush()
         if stale_epochs >= patience:
             print(f"  early stop at ep {ep + 1}; best validation loss at ep {best_epoch}")
             break
+    if best_state is None:
+        raise RuntimeError("VAE training failed before producing a finite validation checkpoint")
     model.load_state_dict(best_state)
     return losses, best_epoch, best_val_loss
 
@@ -348,6 +474,10 @@ def train_seq_gpu(
     patience,
     min_delta,
     lr=1e-3,
+    scheduler: str = "none",
+    warmup_epochs: int = 0,
+    min_lr: float = 1e-5,
+    grad_clip: float = 1.0,
     name="",
     loss_f=None,
 ):
@@ -359,21 +489,54 @@ def train_seq_gpu(
         raise ValueError("Validation segments are shorter than seq_len.")
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    plateau = (
+        torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=0.5,
+            patience=10,
+            min_lr=min_lr,
+        )
+        if scheduler == "plateau"
+        else None
+    )
     losses = []
     best_state, best_val_loss, best_epoch, stale_epochs = None, float("inf"), 0, 0
     for ep in range(epochs):
+        if scheduler == "warmup_cosine":
+            if warmup_epochs > 0 and ep < warmup_epochs:
+                current_lr = lr * float(ep + 1) / float(warmup_epochs)
+            else:
+                denom = max(1, epochs - max(0, warmup_epochs))
+                progress = (ep - max(0, warmup_epochs)) / denom
+                cosine = 0.5 * (1.0 + np.cos(np.pi * min(1.0, max(0.0, progress))))
+                current_lr = min_lr + (lr - min_lr) * cosine
+            for group in opt.param_groups:
+                group["lr"] = current_lr
         model.train()
-        tot, n = 0.0, 0
+        tot, n, skipped = 0.0, 0, 0
         for xb in dl:
             xb = xb.to(DEVICE, non_blocking=True)
             opt.zero_grad()
             recon, _ = model(xb)
             loss = model.loss(xb, recon)
+            if not torch.isfinite(loss):
+                skipped += 1
+                continue
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip, error_if_nonfinite=False
+            )
+            if not torch.isfinite(grad_norm):
+                opt.zero_grad(set_to_none=True)
+                skipped += 1
+                continue
             opt.step()
             tot += loss.item()
             n += 1
+        if n == 0:
+            print(f"  stop at ep {ep + 1}; all sequence batches had non-finite loss/grad")
+            break
         losses.append(tot / n)
         model.eval()
         val_total, val_batches = 0.0, 0
@@ -381,9 +544,17 @@ def train_seq_gpu(
             for xb in val_dl:
                 xb = xb.to(DEVICE, non_blocking=True)
                 recon, _ = model(xb)
-                val_total += model.loss(xb, recon).item()
+                val_loss = model.loss(xb, recon)
+                if not torch.isfinite(val_loss):
+                    val_total = float("nan")
+                    val_batches = 1
+                    break
+                val_total += val_loss.item()
                 val_batches += 1
         current_val_loss = val_total / val_batches
+        if not np.isfinite(current_val_loss):
+            print(f"  stop at ep {ep + 1}; validation loss became non-finite")
+            break
         if current_val_loss < best_val_loss - min_delta:
             best_state = {
                 key: value.detach().cpu().clone() for key, value in model.state_dict().items()
@@ -391,16 +562,25 @@ def train_seq_gpu(
             best_val_loss, best_epoch, stale_epochs = current_val_loss, ep + 1, 0
         else:
             stale_epochs += 1
+        if plateau is not None:
+            plateau.step(current_val_loss)
+        current_lr = float(opt.param_groups[0]["lr"])
         if (ep + 1) % 10 == 0 or ep == 0:
-            print(f"  ep {ep + 1}/{epochs} loss={losses[-1]:.4f} val={current_val_loss:.4f}")
+            print(
+                f"  ep {ep + 1}/{epochs} loss={losses[-1]:.4f} "
+                f"val={current_val_loss:.4f} lr={current_lr:.2e} skipped={skipped}"
+            )
         if loss_f is not None:
             loss_f.write(
-                f"name={name} ep={ep + 1} loss={losses[-1]:.6f} val={current_val_loss:.6f}\n"
+                f"name={name} ep={ep + 1} loss={losses[-1]:.6f} "
+                f"val={current_val_loss:.6f} lr={current_lr:.8g} skipped={skipped}\n"
             )
             loss_f.flush()
         if stale_epochs >= patience:
             print(f"  early stop at ep {ep + 1}; best validation loss at ep {best_epoch}")
             break
+    if best_state is None:
+        raise RuntimeError("Sequence training failed before producing a finite checkpoint")
     model.load_state_dict(best_state)
     return losses, best_epoch, best_val_loss
 
@@ -555,11 +735,25 @@ def run_config(
             cfg["batch"],
             args.patience,
             args.min_delta,
+            lr=cfg.get("lr", 1e-3),
             name=name,
             loss_f=loss_f,
         )
-        validation_scores = validation_scores_vae(model, vae_val, cfg["batch"])
-        records = evaluate_vae_records(model, farms, window, mean, std, use_fft)
+        score_reduction = cfg.get("score_reduction", "sum")
+        include_kld = cfg.get("include_kld", True)
+        validation_scores = validation_scores_vae(
+            model, vae_val, cfg["batch"], score_reduction, include_kld
+        )
+        records = evaluate_vae_records(
+            model,
+            farms,
+            window,
+            mean,
+            std,
+            use_fft,
+            score_reduction=score_reduction,
+            include_kld=include_kld,
+        )
     elif cfg["model"] == "lstm":
         model = LSTMAE(in_dim, seq_len, latent=cfg["latent"], hidden=cfg["hidden"], num_layers=2)
         _, best_epoch, best_val_loss = train_seq_gpu(
@@ -575,7 +769,9 @@ def run_config(
             loss_f=loss_f,
         )
         validation_scores = validation_scores_seq(model, zval_mats, seq_len, cfg["batch"])
-        records = evaluate_seq_records(model, farms, window, seq_len, mean, std, use_fft)
+        records = evaluate_seq_records(
+            model, farms, window, seq_len, mean, std, use_fft, batch=cfg["batch"]
+        )
     else:  # transformer
         nhead = 4 if cfg["hidden"] <= 128 else 8
         model = TransformerAE(
@@ -594,7 +790,9 @@ def run_config(
             loss_f=loss_f,
         )
         validation_scores = validation_scores_seq(model, zval_mats, seq_len, cfg["batch"])
-        records = evaluate_seq_records(model, farms, window, seq_len, mean, std, use_fft)
+        records = evaluate_seq_records(
+            model, farms, window, seq_len, mean, std, use_fft, batch=cfg["batch"]
+        )
 
     elapsed = time.time() - t0
     threshold = adaptive_threshold(validation_scores, args.threshold_percentile)

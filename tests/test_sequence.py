@@ -21,6 +21,52 @@ def test_lstm_ae_forward_and_error():
     assert e.shape == (8,) and torch.isfinite(e).all()
 
 
+def test_lstm_ae_supports_mae_training_loss():
+    x = torch.tensor([[[1.0, -2.0], [3.0, 4.0]]])
+    recon = torch.zeros_like(x)
+    mse = LSTMAE(in_dim=2, seq_len=2, latent=2, hidden=4, decoder_positional="none")
+    mae = LSTMAE(
+        in_dim=2,
+        seq_len=2,
+        latent=2,
+        hidden=4,
+        decoder_positional="none",
+        loss_type="mae",
+    )
+    assert torch.isclose(mse.loss(x, recon), torch.tensor(7.5))
+    assert torch.isclose(mae.loss(x, recon), torch.tensor(2.5))
+
+
+def test_lstm_ae_paper_architecture_forward():
+    model = LSTMAE(
+        in_dim=10,
+        seq_len=12,
+        latent=8,
+        hidden=16,
+        num_layers=2,
+        decoder_init="state",
+        decoder_positional="none",
+        architecture="paper",
+    )
+    recon, z = model(torch.randn(4, 12, 10))
+    assert recon.shape == (4, 12, 10) and z.shape == (4, 8)
+
+
+def test_lstm_ae_direct_latent_forward():
+    model = LSTMAE(
+        in_dim=10,
+        seq_len=12,
+        latent=16,
+        hidden=16,
+        num_layers=2,
+        decoder_init="state",
+        decoder_positional="none",
+        architecture="direct",
+    )
+    recon, z = model(torch.randn(4, 12, 10))
+    assert recon.shape == (4, 12, 10) and z.shape == (4, 16)
+
+
 def test_transformer_ae_forward_and_error():
     m = TransformerAE(in_dim=10, seq_len=12, latent=8, d_model=16)
     x = torch.randn(8, 12, 10)

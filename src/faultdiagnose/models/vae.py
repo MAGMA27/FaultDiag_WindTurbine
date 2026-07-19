@@ -67,9 +67,29 @@ class VAE(nn.Module):
         return self.alpha * recon_loss + self.beta * kld, recon_loss, kld
 
     @torch.no_grad()
-    def reconstruction_error(self, x: torch.Tensor) -> torch.Tensor:
+    def reconstruction_error(
+        self,
+        x: torch.Tensor,
+        reduction: str = "sum",
+        include_kld: bool = True,
+        deterministic: bool = True,
+    ) -> torch.Tensor:
+        """Return per-sample anomaly scores.
+
+        `sum` preserves the original Eq. 11 implementation. `mean` matches the
+        LSTM/Transformer MSE scale and avoids feature-count dominated scores.
+        """
+        if reduction not in {"sum", "mean"}:
+            raise ValueError("reduction must be 'sum' or 'mean'")
         self.eval()
-        recon, mu, logvar = self(x)
-        per_sample_recon = ((recon - x) ** 2).sum(dim=1)
+        mu, logvar = self.encode(x)
+        z = self.reparameterize(mu, logvar, sample=not deterministic)
+        recon = self.decode(z)
+        squared_error = (recon - x) ** 2
+        per_sample_recon = (
+            squared_error.mean(dim=1) if reduction == "mean" else squared_error.sum(dim=1)
+        )
+        if not include_kld:
+            return self.alpha * per_sample_recon
         per_sample_kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
         return self.alpha * per_sample_recon + self.beta * per_sample_kld

@@ -11,6 +11,27 @@ def normalize(scores: np.ndarray, ref_min: float, ref_max: float) -> np.ndarray:
     return np.clip((np.asarray(scores, dtype=float) - ref_min) / (ref_max - ref_min), 0.0, 1.0)
 
 
+def robust_location_scale(scores: np.ndarray) -> tuple[float, float]:
+    """Return median/IQR parameters for validation-only robust score standardization."""
+    finite = np.asarray(scores, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if len(finite) == 0:
+        return 0.0, 1.0
+    q25, median, q75 = np.percentile(finite, [25, 50, 75])
+    scale = float(q75 - q25)
+    if scale <= 1e-12:
+        scale = float(np.std(finite))
+    if scale <= 1e-12:
+        scale = 1.0
+    return float(median), scale
+
+
+def robust_standardize(scores: np.ndarray, median: float, scale: float) -> np.ndarray:
+    """Standardize anomaly scores using validation-only robust location/scale."""
+    safe_scale = scale if scale > 1e-12 else 1.0
+    return (np.asarray(scores, dtype=float) - median) / safe_scale
+
+
 def validation_weights(val_aucs: dict[str, float]) -> dict[str, float]:
     """Ensemble weights from per-model validation AUC (paper: weights learned on validation).
 
@@ -25,12 +46,52 @@ def validation_weights(val_aucs: dict[str, float]) -> dict[str, float]:
     return {k: v / tot for k, v in raw.items()}
 
 
+def validation_stability_weights(per_model_validation: dict[str, np.ndarray]) -> dict[str, float]:
+    """Validation-only weights from finite, stable normal-score behavior.
+
+    The Nair & Babu paper says ensemble weights are learned from validation performance
+    but does not specify the learner. In the frozen unsupervised protocol validation is
+    normal-only, so this helper uses only normal validation stability: finite coverage
+    divided by robust tail spread. It avoids touching prediction labels.
+    """
+    raw: dict[str, float] = {}
+    for name, scores in per_model_validation.items():
+        arr = np.asarray(scores, dtype=float)
+        finite = arr[np.isfinite(arr)]
+        if len(arr) == 0 or len(finite) == 0:
+            raw[name] = 0.0
+            continue
+        _, scale = robust_location_scale(finite)
+        q95, q99 = np.percentile(finite, [95, 99])
+        tail_spread = max(float(q99 - q95), 1e-12)
+        finite_rate = len(finite) / len(arr)
+        raw[name] = finite_rate / (scale + tail_spread)
+    total = sum(raw.values())
+    if total <= 0:
+        n = len(per_model_validation)
+        return {name: 1.0 / n for name in per_model_validation}
+    return {name: value / total for name, value in raw.items()}
+
+
 def combine(per_model: dict[str, np.ndarray], weights: dict[str, float],
             norm: dict[str, tuple[float, float]]) -> np.ndarray:
     """Weighted ensemble of per-model (already normalized) scores."""
     out = np.zeros_like(next(iter(per_model.values())), dtype=float)
     for name, s in per_model.items():
         out += weights.get(name, 0.0) * normalize(s, *norm[name])
+    return out
+
+
+def combine_standardized(
+    per_model: dict[str, np.ndarray],
+    weights: dict[str, float],
+    norm: dict[str, tuple[float, float]],
+) -> np.ndarray:
+    """Weighted average of robust-standardized scores."""
+    first = next(iter(per_model.values()))
+    out = np.zeros_like(np.asarray(first, dtype=float), dtype=float)
+    for name, scores in per_model.items():
+        out += weights.get(name, 0.0) * robust_standardize(scores, *norm[name])
     return out
 
 

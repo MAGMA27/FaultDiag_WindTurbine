@@ -1,0 +1,24 @@
+{
+  "run": {
+    "farms": "B",
+    "window": 48,
+    "cap_train": 60000,
+    "use_fft": true,
+    "label_mode": "operating",
+    "validation_fraction": 0.15,
+    "threshold_percentile": 99.0,
+    "patience": 15,
+    "min_delta": 0.0001,
+    "seed": 20260717,
+    "device": "cuda"
+  },
+  "model": {
+    "name": "farm_b_lstm_h256_l64_w48_s48",
+    "model": "lstm",
+    "hidden": 256,
+    "latent": 64,
+    "epochs": 100,
+    "batch": 128,
+    "seq_len": 48
+  }
+}
