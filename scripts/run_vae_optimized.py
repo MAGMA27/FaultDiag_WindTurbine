@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -11,13 +12,18 @@ import numpy as np
 import pandas as pd
 import torch
 
-import scripts.run_deep_ensemble as deep
-import scripts.run_gpu_tune as gpu
-from faultdiagnose.data import load_care, load_events
-from faultdiagnose.evaluation.anomaly import compute_auc
-from faultdiagnose.evaluation.care import evaluate_care, write_care_artifacts
-from faultdiagnose.evaluation.ensemble import adaptive_threshold, flag
-from faultdiagnose.models import VAE
+# Allow direct execution (`python scripts/run_vae_optimized.py`) from any cwd.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import scripts.run_deep_ensemble as deep  # noqa: E402
+import scripts.run_gpu_tune as gpu  # noqa: E402
+from faultdiagnose.data import load_care, load_events  # noqa: E402
+from faultdiagnose.evaluation.anomaly import compute_auc  # noqa: E402
+from faultdiagnose.evaluation.care import evaluate_care, write_care_artifacts  # noqa: E402
+from faultdiagnose.evaluation.ensemble import adaptive_threshold, flag  # noqa: E402
+from faultdiagnose.models import VAE  # noqa: E402
 
 OUT = load_care.OUT_DEFAULT
 RESULTS = Path(__file__).resolve().parents[1] / "results"
