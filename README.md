@@ -51,7 +51,6 @@ uv sync
 uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-Ubuntu 云服务器若默认只有 Python 3.12，先安装项目要求的 Python 3.13：
 
 ```bash
 git clone <repository-url> FaultDiagnose
@@ -70,8 +69,6 @@ uv run python -c "import torch; print(torch.__version__, torch.version.cuda, tor
 ```powershell
 uv run python src/faultdiagnose/data/load_care.py
 ```
-
-原始数据和生成的 `results/` 均被 Git 忽略。
 
 ### 3. 运行代表性实验
 
