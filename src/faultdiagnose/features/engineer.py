@@ -57,7 +57,8 @@ def engineer_features(
     ``full`` emits _mean, _std, _skew, _kurt, _deriv, _deriv2 [+ _fft].
     ``stat_aware`` preserves each original 10-minute statistic as _raw; it gives
     ``*_avg`` the full dynamic feature set, while ``*_min/_max/_std`` only receive
-    rolling mean and first derivative.
+    rolling mean and first derivative. ``raw_stat_compact`` keeps all original
+    10-minute statistics as _raw, but computes dynamic features only for ``*_avg``.
     Leading window rows are NaN (min_periods=window); dropna before sequencing.
 
     fillna: gap-fill strategy on raw sensors before feature extraction
@@ -65,8 +66,10 @@ def engineer_features(
     clip_sigma: clip raw sensors to +/-clip_sigma robust z after fill, to kill
            sensor spikes that survive as finite but huge values. None = off.
     """
-    if feature_profile not in {"full", "stat_aware"}:
-        raise ValueError("feature_profile must be 'full' or 'stat_aware'")
+    if feature_profile not in {"full", "stat_aware", "raw_stat_compact"}:
+        raise ValueError(
+            "feature_profile must be 'full', 'stat_aware', or 'raw_stat_compact'"
+        )
     if columns is None:
         columns = select_feature_columns(df)
     out: dict[str, pd.Series] = {}
@@ -85,11 +88,14 @@ def engineer_features(
                 s = s.clip(mu - clip_sigma * sd, mu + clip_sigma * sd)
         filled_cache[col] = s
         s = filled_cache[col]
-        if include_raw or feature_profile == "stat_aware":
+        if include_raw or feature_profile in {"stat_aware", "raw_stat_compact"}:
             out[f"{col}_raw"] = s
-        out[f"{col}_mean"] = s.rolling(window, min_periods=window).mean()
-        out[f"{col}_deriv"] = s.diff()
-        if feature_profile == "full" or _statistic_family(col) == "avg":
+        statistic_family = _statistic_family(col)
+        add_dynamic = feature_profile != "raw_stat_compact" or statistic_family == "avg"
+        if add_dynamic:
+            out[f"{col}_mean"] = s.rolling(window, min_periods=window).mean()
+            out[f"{col}_deriv"] = s.diff()
+        if feature_profile == "full" or statistic_family == "avg":
             out[f"{col}_std"] = s.rolling(window, min_periods=window).std()
             out[f"{col}_skew"] = s.rolling(window, min_periods=window).skew()
             out[f"{col}_kurt"] = s.rolling(window, min_periods=window).kurt()

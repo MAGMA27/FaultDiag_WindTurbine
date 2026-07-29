@@ -39,7 +39,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--feature-profile",
-        choices=["full", "stat_aware"],
+        choices=["full", "stat_aware", "raw_stat_compact"],
         default="full",
         help="How original 10-minute avg/min/max/std statistics are expanded.",
     )
@@ -112,7 +112,7 @@ def main() -> None:
     if args.d_model % args.nhead:
         raise SystemExit("--d-model must be divisible by --nhead")
     if args.feature_list is not None and args.feature_profile != "full":
-        raise SystemExit("--feature-list and --feature-profile stat_aware cannot be combined")
+        raise SystemExit("--feature-list and a non-full --feature-profile cannot be combined")
     if args.no_window_cache and args.ram_window_cache:
         raise SystemExit("--no-window-cache and --ram-window-cache cannot be combined")
 

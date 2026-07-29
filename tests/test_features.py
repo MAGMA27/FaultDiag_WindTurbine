@@ -55,6 +55,27 @@ def test_stat_aware_profile_respects_statistic_granularity():
     assert "sensor_1_std_std" not in features
 
 
+def test_raw_stat_compact_keeps_raw_statistics_without_secondary_features():
+    frame = pd.DataFrame(
+        {
+            "sensor_1_avg": np.arange(30, dtype=float),
+            "sensor_1_std": np.linspace(0.0, 1.0, 30),
+        }
+    )
+    features = engineer_features(
+        frame,
+        window=6,
+        columns=list(frame.columns),
+        use_fft=True,
+        feature_profile="raw_stat_compact",
+    )
+    assert features.shape[1] == 9  # avg: raw + 7 dynamic; std: raw only
+    assert "sensor_1_avg_fft" in features
+    assert "sensor_1_std_raw" in features
+    assert "sensor_1_std_mean" not in features
+    assert "sensor_1_std_deriv" not in features
+
+
 def test_vae_forward_and_loss():
     m = VAE(in_dim=10, latent=4, hidden=16)
     x = torch.randn(8, 10)
