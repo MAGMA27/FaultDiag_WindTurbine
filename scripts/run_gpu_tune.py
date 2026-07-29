@@ -405,6 +405,7 @@ def train_vae_gpu(
     )
     losses = []
     best_state, best_val_loss, best_epoch, stale_epochs = None, float("inf"), 0, 0
+    loss_ema: float | None = None
     for ep in range(epochs):
         if kl_anneal_epochs > 0:
             model.beta = target_beta * min(1.0, float(ep + 1) / float(kl_anneal_epochs))
@@ -427,7 +428,12 @@ def train_vae_gpu(
             opt.zero_grad()
             recon, mu, logvar = model(xb)
             loss, _, _ = model.loss(xb, recon, mu, logvar)
-            if not torch.isfinite(loss):
+            batch_loss = float(loss.detach().item())
+            # A finite but astronomically large reconstruction loss can still produce a
+            # clipped update and hide an unstable decoder step.  Normal VAE losses here
+            # are O(10--10^3); skip only clear numerical outliers, not hard examples.
+            outlier_limit = max(1e4, 100.0 * loss_ema) if loss_ema is not None else 1e4
+            if not torch.isfinite(loss) or batch_loss > outlier_limit:
                 skipped += 1
                 continue
             loss.backward()
@@ -439,7 +445,8 @@ def train_vae_gpu(
                 skipped += 1
                 continue
             opt.step()
-            tot += loss.item()
+            loss_ema = batch_loss if loss_ema is None else 0.99 * loss_ema + 0.01 * batch_loss
+            tot += batch_loss
             n += 1
         if n == 0:
             print(f"  stop at ep {ep + 1}; all VAE batches had non-finite loss/grad")
