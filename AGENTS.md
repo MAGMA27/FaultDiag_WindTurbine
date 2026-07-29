@@ -36,7 +36,7 @@ Python 固定 `>=3.13.9,<3.14`；torch 默认安装 CUDA 版（`+cu124`，当前
 
 # 数据处理约定 (Data Conventions)
 
-- CARE 已解压在 `D:\Dev\FaultDiagnose\CARE_To_Compare`；原始 zip 在 `CARE_To_Compare.zip`
+- CARE 数据解压到仓库根目录的 `CARE_To_Compare/`；原始压缩包为 `CARE_To_Compare.zip`
 - 文件为 **`;` 分隔**，时间戳格式 `YYYY-MM-DD HH:MM:SS`，已匿名
 - 三风场特征数不同：Farm A=86、Farm B=257、Farm C=957；字段名各风场不一致，需按 `feature_description.csv` 映射
 - 每风场含 `datasets/<id>.csv`、`event_info.csv`（事件窗口与标签）、`feature_description.csv`（字段字典）

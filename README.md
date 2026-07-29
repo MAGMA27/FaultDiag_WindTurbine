@@ -51,6 +51,18 @@ uv sync
 uv run python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
+Ubuntu 云服务器若默认只有 Python 3.12，先安装项目要求的 Python 3.13：
+
+```bash
+git clone <repository-url> FaultDiagnose
+cd FaultDiagnose
+uv python install 3.13
+uv sync
+uv run python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0))"
+```
+
+服务器的系统 CUDA toolkit 不必与项目 wheel 的 CUDA runtime 完全一致；`uv sync` 会按锁定依赖创建隔离环境。运行前仍应通过 `nvidia-smi` 确认 NVIDIA 驱动和 GPU 可见。
+
 ### 2. 准备数据
 
 将 CARE 解压到 `CARE_To_Compare/`，随后转换为分序列 Parquet：

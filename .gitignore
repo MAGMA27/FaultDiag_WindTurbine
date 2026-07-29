@@ -15,7 +15,9 @@ CARE_To_Compare.zip
 /data/
 results/
 notebooks/.ipynb_checkpoints/
+reference/
 
 # Tooling caches
 .ruff_cache/
-
+tmp/
+.pytest_cache/
