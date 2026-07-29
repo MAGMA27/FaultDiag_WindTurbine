@@ -22,12 +22,15 @@ class SeqWindowsDataset(Dataset):
         mats: Sequence[torch.Tensor | "np.ndarray"],
         seq_len: int,
         cache_path: str | Path | None = None,
+        cache_dtype: torch.dtype = torch.float32,
+        cache_block_windows: int = 2048,
+        materialize_windows: bool = False,
     ):
         self.seq_len = seq_len
         self.windows: torch.Tensor | None = None
         if cache_path is not None and Path(cache_path).exists():
             payload = torch.load(Path(cache_path), map_location="cpu", weights_only=False)
-            if payload.get("seq_len") == seq_len:
+            if payload.get("seq_len") == seq_len and payload.get("dtype") == str(cache_dtype):
                 self.windows = payload["windows"]
                 self.n = len(self.windows)
                 return
@@ -41,19 +44,28 @@ class SeqWindowsDataset(Dataset):
                 self.offsets.append((m, total, cnt))
                 total += cnt
         self.n = total
-        if cache_path is not None:
+        if cache_path is not None or materialize_windows:
             if self.n == 0:
                 raise ValueError("No sequence windows available for cache")
-            chunks = [
-                m.unfold(0, seq_len, 1).permute(0, 2, 1).contiguous()
-                for m, _, _ in self.offsets
-            ]
-            windows = torch.cat(chunks, dim=0).to(dtype=torch.float32)
-            target = Path(cache_path)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            tmp = target.with_suffix(target.suffix + ".tmp")
-            torch.save({"seq_len": seq_len, "windows": windows}, tmp)
-            tmp.replace(target)
+            if cache_block_windows <= 0:
+                raise ValueError("cache_block_windows must be positive")
+            feature_dim = self.offsets[0][0].shape[1]
+            windows = torch.empty((self.n, seq_len, feature_dim), dtype=cache_dtype)
+            write_start = 0
+            for matrix, _, count in self.offsets:
+                for start in range(0, count, cache_block_windows):
+                    stop = min(count, start + cache_block_windows)
+                    block = matrix.unfold(0, seq_len, 1)[start:stop].permute(0, 2, 1)
+                    windows[write_start : write_start + len(block)].copy_(block)
+                    write_start += len(block)
+            if cache_path is not None:
+                target = Path(cache_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_suffix(target.suffix + ".tmp")
+                torch.save(
+                    {"seq_len": seq_len, "dtype": str(cache_dtype), "windows": windows}, tmp
+                )
+                tmp.replace(target)
             self.windows = windows
 
     def __len__(self) -> int:

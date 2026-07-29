@@ -593,19 +593,30 @@ def train_seq_gpu(
     loss_f=None,
     cache_dir: str | Path | None = None,
     max_cache_gb: float = 1.0,
+    cache_dtype: str = "float32",
+    num_workers: int = 0,
+    ram_window_cache: bool = False,
 ):
     model.to(DEVICE)
+    cache_torch_dtype = {"float16": torch.float16, "float32": torch.float32}.get(cache_dtype)
+    if cache_torch_dtype is None:
+        raise ValueError("cache_dtype must be 'float16' or 'float32'")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
     cache_base = Path(cache_dir) if cache_dir is not None else None
+    cache_item_bytes = torch.empty((), dtype=cache_torch_dtype).element_size()
     estimated_cache_bytes = sum(
-        max(0, len(matrix) - seq_len + 1) * seq_len * matrix.shape[1] * 4
+        max(0, len(matrix) - seq_len + 1) * seq_len * matrix.shape[1] * cache_item_bytes
         for matrix in (*zmats, *val_mats)
     )
-    if cache_base is not None and estimated_cache_bytes > max_cache_gb * 1024**3:
+    wants_window_cache = cache_base is not None or ram_window_cache
+    if wants_window_cache and estimated_cache_bytes > max_cache_gb * 1024**3:
         print(
             f"  window cache skipped: estimated {estimated_cache_bytes / 1024**3:.2f} GB "
             f"> limit {max_cache_gb:.2f} GB; using lazy windows"
         )
         cache_base = None
+        ram_window_cache = False
     cache_token = ""
     if cache_base is not None:
         digest = hashlib.sha1()
@@ -626,12 +637,28 @@ def train_seq_gpu(
         if cache_base is not None
         else None
     )
-    ds = SeqWindowsDataset(zmats, seq_len, cache_path=train_cache)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, pin_memory=True)
-    val_ds = SeqWindowsDataset(val_mats, seq_len, cache_path=val_cache)
+    loader_options = {
+        "batch_size": batch_size,
+        "pin_memory": True,
+        "num_workers": num_workers,
+    }
+    if num_workers > 0:
+        loader_options.update({"persistent_workers": True, "prefetch_factor": 2})
+    ds = SeqWindowsDataset(
+        zmats,
+        seq_len,
+        cache_path=train_cache,
+        cache_dtype=cache_torch_dtype,
+        materialize_windows=ram_window_cache,
+    )
+    dl = DataLoader(ds, shuffle=True, **loader_options)
+    val_ds = SeqWindowsDataset(
+        val_mats, seq_len, cache_path=val_cache, cache_dtype=cache_torch_dtype
+        , materialize_windows=ram_window_cache
+    )
     if len(val_ds) == 0:
         raise ValueError("Validation segments are shorter than seq_len.")
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True)
+    val_dl = DataLoader(val_ds, shuffle=False, **loader_options)
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     plateau = (
         torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -660,7 +687,7 @@ def train_seq_gpu(
         model.train()
         tot, n, skipped = 0.0, 0, 0
         for xb in dl:
-            xb = xb.to(DEVICE, non_blocking=True)
+            xb = xb.to(DEVICE, dtype=torch.float32, non_blocking=True)
             opt.zero_grad()
             recon, _ = model(xb)
             loss = model.loss(xb, recon)
@@ -686,7 +713,7 @@ def train_seq_gpu(
         val_total, val_batches = 0.0, 0
         with torch.inference_mode():
             for xb in val_dl:
-                xb = xb.to(DEVICE, non_blocking=True)
+                xb = xb.to(DEVICE, dtype=torch.float32, non_blocking=True)
                 recon, _ = model(xb)
                 val_loss = model.loss(xb, recon)
                 if not torch.isfinite(val_loss):

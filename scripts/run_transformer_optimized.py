@@ -82,11 +82,23 @@ def main() -> None:
     )
     parser.add_argument("--no-window-cache", action="store_true")
     parser.add_argument(
+        "--ram-window-cache",
+        action="store_true",
+        help="Materialize windows in RAM only; does not write a persistent cache file.",
+    )
+    parser.add_argument(
         "--max-window-cache-gb",
         type=float,
         default=1.0,
         help="Skip materialized window cache above this estimated CPU-memory size.",
     )
+    parser.add_argument(
+        "--window-cache-dtype",
+        choices=["float16", "float32"],
+        default="float32",
+        help="Storage dtype for cached windows; float16 halves CPU-memory use.",
+    )
+    parser.add_argument("--num-workers", type=int, default=0)
     args = parser.parse_args()
 
     if not OUT.exists():
@@ -101,6 +113,8 @@ def main() -> None:
         raise SystemExit("--d-model must be divisible by --nhead")
     if args.feature_list is not None and args.feature_profile != "full":
         raise SystemExit("--feature-list and --feature-profile stat_aware cannot be combined")
+    if args.no_window_cache and args.ram_window_cache:
+        raise SystemExit("--no-window-cache and --ram-window-cache cannot be combined")
 
     use_fft = not args.no_fft
     farms = [farm.strip() for farm in args.farms.split(",")]
@@ -165,8 +179,13 @@ def main() -> None:
             grad_clip=args.grad_clip,
             name="transformer_optimized",
             loss_f=loss_file,
-            cache_dir=None if args.no_window_cache else args.window_cache_dir,
+            cache_dir=(
+                None if args.no_window_cache or args.ram_window_cache else args.window_cache_dir
+            ),
             max_cache_gb=args.max_window_cache_gb,
+            cache_dtype=args.window_cache_dtype,
+            num_workers=args.num_workers,
+            ram_window_cache=args.ram_window_cache,
         )
     validation_scores = gpu.validation_scores_seq(model, validation_mats, args.seq_len, args.batch)
     threshold = adaptive_threshold(validation_scores, args.threshold_percentile)
@@ -213,7 +232,12 @@ def main() -> None:
         "architecture": args.architecture,
         "epochs": args.epochs,
         "batch": args.batch,
-        "window_cache_dir": None if args.no_window_cache else args.window_cache_dir,
+        "window_cache_dir": (
+            None if args.no_window_cache or args.ram_window_cache else args.window_cache_dir
+        ),
+        "window_cache_dtype": args.window_cache_dtype,
+        "ram_window_cache": args.ram_window_cache,
+        "num_workers": args.num_workers,
         "lr": args.lr,
         "scheduler": args.scheduler,
         "warmup_epochs": args.warmup_epochs,
