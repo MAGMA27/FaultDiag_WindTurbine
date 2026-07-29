@@ -28,6 +28,20 @@ def select_feature_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
 
 
+def _statistic_family(column: str) -> str:
+    """Classify the original 10-minute SCADA statistic encoded in a column name."""
+    for suffix, family in (
+        ("_avg", "avg"),
+        ("_min", "min"),
+        ("_max", "max"),
+        ("_std", "std"),
+        ("_std_dev", "std"),
+    ):
+        if column.endswith(suffix):
+            return family
+    return "other"
+
+
 def engineer_features(
     df: pd.DataFrame,
     window: int = DEFAULT_WIN,
@@ -36,10 +50,14 @@ def engineer_features(
     use_fft: bool = False,
     fillna: str | None = "ffill",
     clip_sigma: float | None = 5.0,
+    feature_profile: str = "full",
 ) -> pd.DataFrame:
     """Sliding-window temporal/statistical/frequency features (paper Section II.A).
 
-    Per input column emits: _mean, _std, _skew, _kurt, _deriv, _deriv2 [+ _fft if use_fft].
+    ``full`` emits _mean, _std, _skew, _kurt, _deriv, _deriv2 [+ _fft].
+    ``stat_aware`` preserves each original 10-minute statistic as _raw; it gives
+    ``*_avg`` the full dynamic feature set, while ``*_min/_max/_std`` only receive
+    rolling mean and first derivative.
     Leading window rows are NaN (min_periods=window); dropna before sequencing.
 
     fillna: gap-fill strategy on raw sensors before feature extraction
@@ -47,6 +65,8 @@ def engineer_features(
     clip_sigma: clip raw sensors to +/-clip_sigma robust z after fill, to kill
            sensor spikes that survive as finite but huge values. None = off.
     """
+    if feature_profile not in {"full", "stat_aware"}:
+        raise ValueError("feature_profile must be 'full' or 'stat_aware'")
     if columns is None:
         columns = select_feature_columns(df)
     out: dict[str, pd.Series] = {}
@@ -65,16 +85,17 @@ def engineer_features(
                 s = s.clip(mu - clip_sigma * sd, mu + clip_sigma * sd)
         filled_cache[col] = s
         s = filled_cache[col]
-        out[f"{col}_mean"] = s.rolling(window, min_periods=window).mean()
-        out[f"{col}_std"] = s.rolling(window, min_periods=window).std()
-        out[f"{col}_skew"] = s.rolling(window, min_periods=window).skew()
-        out[f"{col}_kurt"] = s.rolling(window, min_periods=window).kurt()
-        out[f"{col}_deriv"] = s.diff()
-        out[f"{col}_deriv2"] = s.diff().diff()  # x_t - 2x_{t-1} + x_{t-2}
-        if use_fft:
-            out[f"{col}_fft"] = _fft_dominant_feature(s.to_numpy(), window)
-        if include_raw:
+        if include_raw or feature_profile == "stat_aware":
             out[f"{col}_raw"] = s
+        out[f"{col}_mean"] = s.rolling(window, min_periods=window).mean()
+        out[f"{col}_deriv"] = s.diff()
+        if feature_profile == "full" or _statistic_family(col) == "avg":
+            out[f"{col}_std"] = s.rolling(window, min_periods=window).std()
+            out[f"{col}_skew"] = s.rolling(window, min_periods=window).skew()
+            out[f"{col}_kurt"] = s.rolling(window, min_periods=window).kurt()
+            out[f"{col}_deriv2"] = s.diff().diff()  # x_t - 2x_{t-1} + x_{t-2}
+            if use_fft:
+                out[f"{col}_fft"] = _fft_dominant_feature(s.to_numpy(), window)
     # ponytail: build from dict in one shot to avoid per-column DataFrame fragmentation
     return pd.DataFrame(out, index=df.index)
 
@@ -100,7 +121,8 @@ def iter_sequences(features: pd.DataFrame, seq_len: int):
 def fit_standardizer(features) -> tuple[np.ndarray, np.ndarray]:
     """z-score stats (mean, std) per column, positionally. Works on DataFrame or ndarray."""
     arr = features.values if hasattr(features, "values") else np.asarray(features)
-    # ponytail: dead/constant sensors (std~0 or non-finite) poison z-score -> 1.0 so x-mean stays finite
+    # ponytail: dead/constant sensors (std~0 or non-finite) poison z-score;
+    # substitute 1.0 so x-mean stays finite.
     return arr.mean(axis=0), np.nan_to_num(arr.std(axis=0), nan=1.0, posinf=1.0, neginf=1.0)
 
 

@@ -2,6 +2,7 @@
 
 import math
 from collections.abc import Sequence
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,8 +17,20 @@ class SeqWindowsDataset(Dataset):
     ever materialized, so this scales to the full CARE test set on CPU.
     """
 
-    def __init__(self, mats: Sequence[torch.Tensor | "np.ndarray"], seq_len: int):
+    def __init__(
+        self,
+        mats: Sequence[torch.Tensor | "np.ndarray"],
+        seq_len: int,
+        cache_path: str | Path | None = None,
+    ):
         self.seq_len = seq_len
+        self.windows: torch.Tensor | None = None
+        if cache_path is not None and Path(cache_path).exists():
+            payload = torch.load(Path(cache_path), map_location="cpu", weights_only=False)
+            if payload.get("seq_len") == seq_len:
+                self.windows = payload["windows"]
+                self.n = len(self.windows)
+                return
         self.offsets: list[tuple[torch.Tensor, int, int]] = []
         total = 0
         for m in mats:
@@ -28,11 +41,27 @@ class SeqWindowsDataset(Dataset):
                 self.offsets.append((m, total, cnt))
                 total += cnt
         self.n = total
+        if cache_path is not None:
+            if self.n == 0:
+                raise ValueError("No sequence windows available for cache")
+            chunks = [
+                m.unfold(0, seq_len, 1).permute(0, 2, 1).contiguous()
+                for m, _, _ in self.offsets
+            ]
+            windows = torch.cat(chunks, dim=0).to(dtype=torch.float32)
+            target = Path(cache_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_suffix(target.suffix + ".tmp")
+            torch.save({"seq_len": seq_len, "windows": windows}, tmp)
+            tmp.replace(target)
+            self.windows = windows
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> torch.Tensor:
+        if self.windows is not None:
+            return self.windows[idx]
         for m, base, cnt in self.offsets:
             if idx < base + cnt:
                 i = idx - base
@@ -190,9 +219,13 @@ class TransformerAE(nn.Module):
         nhead: int = 4,
         num_layers: int = 2,
         dropout: float = 0.1,
+        architecture: str = "broadcast",
     ):
         super().__init__()
+        if architecture not in {"broadcast", "cross_attention"}:
+            raise ValueError("architecture must be 'broadcast' or 'cross_attention'")
         self.seq_len = seq_len
+        self.architecture = architecture
         self.in_proj = nn.Linear(in_dim, d_model)
         self.pos = PositionalEncoding(d_model)
         enc_layer = nn.TransformerEncoderLayer(
@@ -201,16 +234,28 @@ class TransformerAE(nn.Module):
         self.encoder = nn.TransformerEncoder(enc_layer, num_layers)
         self.pool = nn.Linear(d_model, latent)
         self.unpool = nn.Linear(latent, d_model)
-        dec_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True
-        )
-        self.decoder = nn.TransformerEncoder(dec_layer, num_layers)
+        if architecture == "broadcast":
+            dec_layer = nn.TransformerEncoderLayer(
+                d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True
+            )
+            self.decoder = nn.TransformerEncoder(dec_layer, num_layers)
+        else:
+            dec_layer = nn.TransformerDecoderLayer(
+                d_model, nhead, dim_feedforward=d_model * 4, dropout=dropout, batch_first=True
+            )
+            self.decoder = nn.TransformerDecoder(dec_layer, num_layers)
         self.out = nn.Linear(d_model, in_dim)
 
     def forward(self, x):
-        z = self.pool(self.encoder(self.pos(self.in_proj(x))).mean(dim=1))  # [B, latent]
+        memory = self.encoder(self.pos(self.in_proj(x)))
+        z = self.pool(memory.mean(dim=1))  # [B, latent]
         dec_in = self.unpool(z).unsqueeze(1).repeat(1, self.seq_len, 1)  # [B, T, d_model]
-        return self.out(self.decoder(self.pos(dec_in))), z
+        target = self.pos(dec_in)
+        if self.architecture == "broadcast":
+            decoded = self.decoder(target)
+        else:
+            decoded = self.decoder(target, memory)
+        return self.out(decoded), z
 
     def loss(self, x, recon):
         return ((recon - x) ** 2).mean()

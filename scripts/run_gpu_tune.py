@@ -10,6 +10,7 @@ Key departures from the CPU scripts:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import time
@@ -121,6 +122,21 @@ def _feature_columns(
     return columns
 
 
+def _select_engineered_features(
+    frame: pd.DataFrame,
+    farm: str,
+    engineered_feature_columns_by_farm: dict[str, list[str]] | None,
+) -> pd.DataFrame:
+    """Restrict post-engineering features, for a train-only feature-audit selection."""
+    if engineered_feature_columns_by_farm is None or farm not in engineered_feature_columns_by_farm:
+        return frame
+    columns = engineered_feature_columns_by_farm[farm]
+    missing = sorted(set(columns).difference(frame.columns))
+    if missing:
+        raise ValueError(f"Farm {farm} is missing engineered features: {missing[:10]}")
+    return frame.loc[:, columns]
+
+
 def collect_all(
     farms,
     window,
@@ -128,6 +144,8 @@ def collect_all(
     validation_fraction,
     use_fft=False,
     feature_columns_by_farm: dict[str, list[str]] | None = None,
+    engineered_feature_columns_by_farm: dict[str, list[str]] | None = None,
+    feature_profile: str = "full",
 ):
     """Collect both VAE (flat) mats and LSTM (sequence) mats from normal data."""
     events = load_events(OUT)
@@ -153,6 +171,10 @@ def collect_all(
                     use_fft=use_fft,
                     fillna="ffill",
                     clip_sigma=5.0,
+                    feature_profile=feature_profile,
+                )
+                feats = _select_engineered_features(
+                    feats, farm, engineered_feature_columns_by_farm
                 ).dropna()
                 if len(feats) == 0:
                     continue
@@ -196,6 +218,7 @@ def evaluate_vae_records(
     feature_columns_by_farm: dict[str, list[str]] | None = None,
     score_reduction: str = "sum",
     include_kld: bool = True,
+    feature_profile: str = "full",
 ):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
@@ -214,6 +237,7 @@ def evaluate_vae_records(
                     use_fft=use_fft,
                     fillna="ffill",
                     clip_sigma=5.0,
+                    feature_profile=feature_profile,
                 ).dropna()
                 if len(feats) == 0:
                     continue
@@ -243,6 +267,8 @@ def evaluate_seq_records(
     use_fft=False,
     batch=4096,
     feature_columns_by_farm: dict[str, list[str]] | None = None,
+    engineered_feature_columns_by_farm: dict[str, list[str]] | None = None,
+    feature_profile: str = "full",
 ):
     """Score sequence windows and retain the complete prediction status timeline."""
     records_list = []
@@ -261,6 +287,10 @@ def evaluate_seq_records(
                     use_fft=use_fft,
                     fillna="ffill",
                     clip_sigma=5.0,
+                    feature_profile=feature_profile,
+                )
+                feats = _select_engineered_features(
+                    feats, farm, engineered_feature_columns_by_farm
                 ).dropna()
                 if len(feats) < seq_len:
                     continue
@@ -464,6 +494,80 @@ def train_vae_gpu(
     return losses, best_epoch, best_val_loss
 
 
+def train_dense_ae_gpu(
+    model,
+    X: np.ndarray,
+    X_val: np.ndarray,
+    epochs: int,
+    batch_size: int,
+    patience: int,
+    min_delta: float,
+    lr: float = 1e-3,
+    noise_std: float = 0.0,
+    name: str = "dense_ae",
+    loss_f=None,
+):
+    """Train a deterministic denoising autoencoder and restore its best checkpoint."""
+    model.to(DEVICE)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    train_loader = DataLoader(
+        torch.from_numpy(X).float(), batch_size=batch_size, shuffle=True, pin_memory=True
+    )
+    validation_loader = DataLoader(
+        torch.from_numpy(X_val).float(), batch_size=batch_size, shuffle=False, pin_memory=True
+    )
+    losses: list[float] = []
+    best_state, best_val_loss, best_epoch, stale_epochs = None, float("inf"), 0, 0
+    for epoch in range(epochs):
+        model.train()
+        total, batches = 0.0, 0
+        for clean_x in train_loader:
+            clean_x = clean_x.to(DEVICE, non_blocking=True)
+            noisy_x = clean_x + noise_std * torch.randn_like(clean_x) if noise_std else clean_x
+            optimizer.zero_grad(set_to_none=True)
+            loss = torch.nn.functional.mse_loss(model(noisy_x), clean_x)
+            loss.backward()
+            optimizer.step()
+            total += loss.item()
+            batches += 1
+        train_loss = total / batches
+        losses.append(train_loss)
+        model.eval()
+        validation_total, validation_batches = 0.0, 0
+        with torch.inference_mode():
+            for clean_x in validation_loader:
+                clean_x = clean_x.to(DEVICE, non_blocking=True)
+                validation_total += torch.nn.functional.mse_loss(model(clean_x), clean_x).item()
+                validation_batches += 1
+        validation_loss = validation_total / validation_batches
+        if validation_loss < best_val_loss - min_delta:
+            best_state = {
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            }
+            best_val_loss, best_epoch, stale_epochs = validation_loss, epoch + 1, 0
+        else:
+            stale_epochs += 1
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(
+                f"  ep {epoch + 1}/{epochs} loss={train_loss:.4f} "
+                f"val={validation_loss:.4f} noise={noise_std:.3g}",
+                flush=True,
+            )
+        if loss_f is not None:
+            loss_f.write(
+                f"name={name} ep={epoch + 1} loss={train_loss:.6f} "
+                f"val={validation_loss:.6f} noise={noise_std:.6g}\n"
+            )
+            loss_f.flush()
+        if stale_epochs >= patience:
+            print(f"  early stop at ep {epoch + 1}; best validation loss at ep {best_epoch}")
+            break
+    if best_state is None:
+        raise RuntimeError("dense AE training failed before producing a checkpoint")
+    model.load_state_dict(best_state)
+    return losses, best_epoch, best_val_loss
+
+
 def train_seq_gpu(
     model,
     zmats,
@@ -480,11 +584,44 @@ def train_seq_gpu(
     grad_clip: float = 1.0,
     name="",
     loss_f=None,
+    cache_dir: str | Path | None = None,
+    max_cache_gb: float = 1.0,
 ):
     model.to(DEVICE)
-    ds = SeqWindowsDataset(zmats, seq_len)
+    cache_base = Path(cache_dir) if cache_dir is not None else None
+    estimated_cache_bytes = sum(
+        max(0, len(matrix) - seq_len + 1) * seq_len * matrix.shape[1] * 4
+        for matrix in (*zmats, *val_mats)
+    )
+    if cache_base is not None and estimated_cache_bytes > max_cache_gb * 1024**3:
+        print(
+            f"  window cache skipped: estimated {estimated_cache_bytes / 1024**3:.2f} GB "
+            f"> limit {max_cache_gb:.2f} GB; using lazy windows"
+        )
+        cache_base = None
+    cache_token = ""
+    if cache_base is not None:
+        digest = hashlib.sha1()
+        digest.update(str(seq_len).encode())
+        for matrix in (*zmats, *val_mats):
+            array = np.asarray(matrix)
+            digest.update(str(array.shape).encode())
+            sample_step = max(1, len(array) // 1024)
+            digest.update(array[::sample_step].tobytes())
+        cache_token = digest.hexdigest()[:16]
+    train_cache = (
+        cache_base / f"{name}_train_seq{seq_len}_{cache_token}.pt"
+        if cache_base is not None
+        else None
+    )
+    val_cache = (
+        cache_base / f"{name}_val_seq{seq_len}_{cache_token}.pt"
+        if cache_base is not None
+        else None
+    )
+    ds = SeqWindowsDataset(zmats, seq_len, cache_path=train_cache)
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, pin_memory=True)
-    val_ds = SeqWindowsDataset(val_mats, seq_len)
+    val_ds = SeqWindowsDataset(val_mats, seq_len, cache_path=val_cache)
     if len(val_ds) == 0:
         raise ValueError("Validation segments are shorter than seq_len.")
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, pin_memory=True)

@@ -11,6 +11,18 @@ def normalize(scores: np.ndarray, ref_min: float, ref_max: float) -> np.ndarray:
     return np.clip((np.asarray(scores, dtype=float) - ref_min) / (ref_max - ref_min), 0.0, 1.0)
 
 
+def empirical_percentile_rank(scores: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """Map scores to percentile ranks using only a finite reference distribution."""
+    reference = np.sort(np.asarray(reference, dtype=float)[np.isfinite(reference)])
+    if len(reference) == 0:
+        raise ValueError("percentile-rank reference has no finite scores")
+    array = np.asarray(scores, dtype=float)
+    ranks = np.full(array.shape, np.nan, dtype=float)
+    finite = np.isfinite(array)
+    ranks[finite] = np.searchsorted(reference, array[finite], side="right") / len(reference)
+    return ranks
+
+
 def robust_location_scale(scores: np.ndarray) -> tuple[float, float]:
     """Return median/IQR parameters for validation-only robust score standardization."""
     finite = np.asarray(scores, dtype=float)

@@ -76,6 +76,20 @@ def test_transformer_ae_forward_and_error():
     assert e.shape == (8,) and torch.isfinite(e).all()
 
 
+def test_transformer_cross_attention_forward():
+    m = TransformerAE(
+        in_dim=10,
+        seq_len=12,
+        latent=8,
+        d_model=16,
+        nhead=4,
+        architecture="cross_attention",
+    )
+    x = torch.randn(4, 12, 10)
+    recon, z = m(x)
+    assert recon.shape == x.shape and z.shape == (4, 8)
+
+
 def test_seq_train_runs():
     torch.manual_seed(0)
     mats = [np.random.randn(100, 6).astype("float32"), np.random.randn(80, 6).astype("float32")]
@@ -84,3 +98,12 @@ def test_seq_train_runs():
 
     losses = train_seq_ae(m, mats, seq_len=10, epochs=2, batch_size=32, verbose=False)
     assert len(losses) == 2 and all(np.isfinite(losses))
+
+
+def test_sequence_window_cache_round_trip(tmp_path):
+    mats = [torch.randn(9, 3), torch.randn(7, 3)]
+    cache = tmp_path / "windows.pt"
+    first = SeqWindowsDataset(mats, seq_len=4, cache_path=cache)
+    second = SeqWindowsDataset(mats, seq_len=4, cache_path=cache)
+    assert len(first) == len(second) == 10
+    assert torch.equal(first[3], second[3])

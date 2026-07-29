@@ -1,4 +1,5 @@
 ﻿import numpy as np
+import pandas as pd
 import pytest
 import torch
 
@@ -10,6 +11,7 @@ from faultdiagnose.features import (
     fit_standardizer,
     select_feature_columns,
 )
+from faultdiagnose.features.audit import audit_feature_matrix
 from faultdiagnose.models import VAE
 from faultdiagnose.training.vae_trainer import train_vae
 
@@ -31,6 +33,26 @@ def test_engineer_shapes_and_finite():
     clean = feats.dropna()
     assert len(clean) > 1000
     assert np.isfinite(clean.to_numpy()).all()
+
+
+def test_stat_aware_profile_respects_statistic_granularity():
+    frame = pd.DataFrame(
+        {
+            "sensor_1_avg": np.arange(30, dtype=float),
+            "sensor_1_std": np.linspace(0.0, 1.0, 30),
+        }
+    )
+    features = engineer_features(
+        frame,
+        window=6,
+        columns=list(frame.columns),
+        use_fft=True,
+        feature_profile="stat_aware",
+    )
+    assert features.shape[1] == 11  # avg: raw + 7 dynamic; std: raw + mean + derivative
+    assert "sensor_1_avg_fft" in features
+    assert "sensor_1_std_raw" in features
+    assert "sensor_1_std_std" not in features
 
 
 def test_vae_forward_and_loss():
@@ -62,3 +84,29 @@ def test_compute_auc_perfect():
     scores = np.array([0.1, 0.9, 0.2, 0.8])
     labels = np.array([0, 1, 0, 1])
     assert compute_auc(scores, labels) == 1.0
+
+
+def test_feature_audit_drops_duplicate_and_clusters_correlations():
+    base = np.arange(20, dtype=float)
+    features = pd.DataFrame(
+        {
+            "sensor_1_avg_mean": base,
+            "sensor_2_mean": base * 2,
+            "sensor_3_std": base.copy(),
+            "constant_mean": np.ones_like(base),
+        }
+    )
+    stats, clusters, selected = audit_feature_matrix(
+        features, correlation_threshold=0.999, drop_near_constant=True
+    )
+    assert "constant_mean" not in selected
+    assert selected == ["sensor_1_avg_mean"]
+    assert len(clusters) == 2
+    duplicate_reason = stats.loc[stats["feature"] == "sensor_3_std", "drop_reason"].item()
+    assert duplicate_reason.startswith("duplicate_of:")
+
+
+def test_feature_audit_protects_near_constant_features_by_default():
+    features = pd.DataFrame({"constant_mean": np.ones(20), "varying_mean": np.arange(20)})
+    _, _, selected = audit_feature_matrix(features)
+    assert set(selected) == {"constant_mean", "varying_mean"}
