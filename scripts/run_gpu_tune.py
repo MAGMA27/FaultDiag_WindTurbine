@@ -208,6 +208,17 @@ def _empty_prediction_records(df: pd.DataFrame, farm: str, dataset_id: str) -> p
     return records
 
 
+def _predicted_normal_scores(threshold_model, inputs: np.ndarray, batch_size: int) -> np.ndarray:
+    """Predict expected normal score from standardized model inputs."""
+    loader = DataLoader(torch.from_numpy(inputs).float(), batch_size=batch_size, shuffle=False)
+    values: list[np.ndarray] = []
+    threshold_model.eval()
+    with torch.inference_mode():
+        for xb in loader:
+            values.append(threshold_model(xb.to(DEVICE, non_blocking=True)).cpu().numpy())
+    return np.concatenate(values) if values else np.empty(0, dtype=np.float32)
+
+
 def evaluate_vae_records(
     model,
     farms,
@@ -219,6 +230,8 @@ def evaluate_vae_records(
     score_reduction: str = "sum",
     include_kld: bool = True,
     feature_profile: str = "full",
+    threshold_model=None,
+    threshold_batch: int = 4096,
 ):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
@@ -252,6 +265,8 @@ def evaluate_vae_records(
                         .cpu()
                         .numpy()
                     )
+                if threshold_model is not None:
+                    scores = scores - _predicted_normal_scores(threshold_model, Z, threshold_batch)
                 records.loc[feats.index, "score"] = scores
             records_list.append(records)
     return pd.concat(records_list, ignore_index=True)
@@ -269,6 +284,8 @@ def evaluate_seq_records(
     feature_columns_by_farm: dict[str, list[str]] | None = None,
     engineered_feature_columns_by_farm: dict[str, list[str]] | None = None,
     feature_profile: str = "full",
+    threshold_model=None,
+    threshold_batch: int = 4096,
 ):
     """Score sequence windows and retain the complete prediction status timeline."""
     records_list = []
@@ -304,6 +321,11 @@ def evaluate_seq_records(
                         e = model.reconstruction_error(xb.to(DEVICE, non_blocking=True))
                         win_err[pos : pos + len(e)] = e.cpu().numpy()
                         pos += len(e)
+                if threshold_model is not None:
+                    expected = _predicted_normal_scores(
+                        threshold_model, Z[seq_len - 1 :], threshold_batch
+                    )
+                    win_err = win_err - expected
                 scores = np.empty(len(feats), dtype=np.float32)
                 scores[: seq_len - 1] = win_err[0]
                 scores[seq_len - 1 :] = win_err
@@ -349,6 +371,25 @@ def validation_scores_seq(
                 model.reconstruction_error(xb.to(DEVICE, non_blocking=True)).cpu().numpy()
             )
     return np.concatenate(errors)
+
+
+def sequence_inputs_and_scores(
+    model, matrices: list[np.ndarray], seq_len: int, batch_size: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return last-step inputs aligned with sequence reconstruction scores."""
+    dataset = SeqWindowsDataset(matrices, seq_len)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, pin_memory=True)
+    inputs: list[np.ndarray] = []
+    errors: list[np.ndarray] = []
+    with torch.inference_mode():
+        for xb in loader:
+            inputs.append(xb[:, -1, :].numpy())
+            errors.append(
+                model.reconstruction_error(xb.to(DEVICE, non_blocking=True)).cpu().numpy()
+            )
+    if not inputs:
+        raise ValueError("sequence matrices are shorter than seq_len")
+    return np.concatenate(inputs), np.concatenate(errors)
 
 
 def _records_to_auc_arrays(records: pd.DataFrame, ev_map: dict) -> tuple[np.ndarray, np.ndarray]:

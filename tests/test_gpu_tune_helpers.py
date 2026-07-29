@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+import torch
+
+from faultdiagnose.training import predicted_normal_scores, train_adaptive_threshold
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "run_gpu_tune.py"
 FORMAL_CONFIG_PATH = (
@@ -83,3 +86,37 @@ def test_formal_config_loads_model_and_run_parameters():
 
     assert config["run"]["window"] == 48
     assert config["model"]["name"] == "lstm_h256_l64_w48_full"
+
+
+def test_adaptive_threshold_regressor_predicts_aligned_scores():
+    rng = np.random.default_rng(7)
+    features = rng.normal(size=(32, 4)).astype(np.float32)
+    scores = (features[:, 0] ** 2 + 0.1).astype(np.float32)
+
+    model = train_adaptive_threshold(
+        features,
+        scores,
+        hidden=8,
+        learning_rate=1e-2,
+        epochs=3,
+        batch_size=16,
+        device="cpu",
+        verbose=False,
+    )
+    predicted = predicted_normal_scores(model, features, batch_size=16, device="cpu")
+
+    assert predicted.shape == scores.shape
+    assert np.isfinite(predicted).all()
+
+
+def test_sequence_inputs_align_with_window_scores():
+    class DummySequenceModel(torch.nn.Module):
+        def reconstruction_error(self, x):
+            return x.square().mean(dim=(1, 2))
+
+    matrix = np.arange(24, dtype=np.float32).reshape(8, 3)
+    inputs, scores = GPU_TUNE.sequence_inputs_and_scores(DummySequenceModel(), [matrix], 3, 2)
+
+    assert inputs.shape == (6, 3)
+    assert np.array_equal(inputs[0], matrix[2])
+    assert scores.shape == (6,)

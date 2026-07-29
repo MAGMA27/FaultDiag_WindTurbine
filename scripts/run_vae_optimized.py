@@ -24,6 +24,7 @@ from faultdiagnose.evaluation.anomaly import compute_auc  # noqa: E402
 from faultdiagnose.evaluation.care import evaluate_care, write_care_artifacts  # noqa: E402
 from faultdiagnose.evaluation.ensemble import adaptive_threshold, flag  # noqa: E402
 from faultdiagnose.models import VAE  # noqa: E402
+from faultdiagnose.training import predicted_normal_scores, train_adaptive_threshold  # noqa: E402
 
 OUT = load_care.OUT_DEFAULT
 RESULTS = Path(__file__).resolve().parents[1] / "results"
@@ -71,6 +72,16 @@ def main() -> None:
     parser.add_argument("--cap-train", type=int, default=60000)
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--threshold-percentile", type=float, default=99.0)
+    parser.add_argument(
+        "--threshold-mode",
+        choices=["percentile", "adaptive_nn"],
+        default="percentile",
+        help="Fixed normal-score percentile or CARE-style input-conditioned threshold.",
+    )
+    parser.add_argument("--threshold-hidden", type=int, default=128)
+    parser.add_argument("--threshold-lr", type=float, default=1e-3)
+    parser.add_argument("--threshold-epochs", type=int, default=300)
+    parser.add_argument("--threshold-batch", type=int, default=2048)
     parser.add_argument("--hidden", type=int, default=256)
     parser.add_argument("--latent", type=int, default=64)
     parser.add_argument("--beta", type=float, default=0.1)
@@ -156,7 +167,28 @@ def main() -> None:
         args.score_reduction,
         include_kld,
     )
+    threshold_model = None
+    threshold_checkpoint = None
     threshold = adaptive_threshold(validation_scores, args.threshold_percentile)
+    if args.threshold_mode == "adaptive_nn":
+        train_scores = gpu.validation_scores_vae(
+            model, train_x, args.batch, args.score_reduction, include_kld
+        )
+        threshold_model = train_adaptive_threshold(
+            train_x,
+            train_scores,
+            hidden=args.threshold_hidden,
+            learning_rate=args.threshold_lr,
+            epochs=args.threshold_epochs,
+            batch_size=args.threshold_batch,
+            device=gpu.DEVICE,
+        )
+        validation_expected = predicted_normal_scores(
+            threshold_model, validation_x, batch_size=args.threshold_batch, device=gpu.DEVICE
+        )
+        threshold = adaptive_threshold(
+            validation_scores - validation_expected, args.threshold_percentile
+        )
     records = gpu.evaluate_vae_records(
         model,
         farms,
@@ -167,6 +199,8 @@ def main() -> None:
         configured_columns,
         score_reduction=args.score_reduction,
         include_kld=include_kld,
+        threshold_model=threshold_model,
+        threshold_batch=args.threshold_batch,
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
 
@@ -179,6 +213,9 @@ def main() -> None:
     checkpoint_path = CHECKPOINTS / f"{stamp}_vae_optimized.pt"
     norm_path = CHECKPOINTS / f"{stamp}_vae_optimized_norm.npz"
     torch.save(model.state_dict(), checkpoint_path)
+    if threshold_model is not None:
+        threshold_checkpoint = CHECKPOINTS / f"{stamp}_vae_optimized_adaptive_threshold.pt"
+        torch.save(threshold_model.state_dict(), threshold_checkpoint)
     np.savez(norm_path, mean=mean, std=std)
 
     result = {
@@ -207,6 +244,9 @@ def main() -> None:
         "loss_tail": [float(value) for value in losses[-10:]],
         "threshold": float(threshold),
         "threshold_percentile": args.threshold_percentile,
+        "threshold_mode": args.threshold_mode,
+        "threshold_hidden": args.threshold_hidden if threshold_model is not None else None,
+        "threshold_checkpoint": str(threshold_checkpoint) if threshold_checkpoint else None,
         "auc_roc": float(auc),
         "n_train": int(len(train_x)),
         "n_validation": int(len(validation_x)),
