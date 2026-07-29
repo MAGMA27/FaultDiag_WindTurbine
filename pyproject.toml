@@ -3,9 +3,7 @@ name = "faultdiagnose"
 version = "0.1.0"
 description = "Reproducing hybrid autoencoder-based early fault detection for wind turbines (Nair & Babu, 2025) on the CARE SCADA dataset."
 readme = "README.md"
-authors = [
-    { name = "InfiHeart", email = "785783195@qq.com" }
-]
+
 requires-python = ">=3.13.9,<3.14"
 dependencies = [
     "torch>=2.5.0",
