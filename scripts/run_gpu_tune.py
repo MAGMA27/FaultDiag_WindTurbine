@@ -137,6 +137,48 @@ def _select_engineered_features(
     return frame.loc[:, columns]
 
 
+def _balanced_quotas(total: int, count: int) -> list[int]:
+    """Split a sample budget as evenly as possible over normal sequences."""
+    if total <= 0 or count <= 0:
+        return [0] * count
+    base, remainder = divmod(total, count)
+    return [base + int(index < remainder) for index in range(count)]
+
+
+def _contiguous_balanced_chunks(
+    segments: list[np.ndarray], quota: int, block_size: int = 4096
+) -> list[np.ndarray]:
+    """Take evenly spaced contiguous blocks without creating artificial sequences."""
+    available = sum(len(segment) for segment in segments)
+    take = min(quota, available)
+    if take <= 0:
+        return []
+    lengths = np.asarray([len(segment) for segment in segments], dtype=np.float64)
+    raw = lengths / lengths.sum() * take
+    allocation = np.floor(raw).astype(int)
+    allocation = np.minimum(allocation, lengths.astype(int))
+    remaining = take - int(allocation.sum())
+    for index in np.argsort(-(raw - allocation)):
+        if remaining == 0:
+            break
+        if allocation[index] < lengths[index]:
+            allocation[index] += 1
+            remaining -= 1
+
+    chunks: list[np.ndarray] = []
+    for segment, segment_take in zip(segments, allocation, strict=True):
+        if segment_take == 0:
+            continue
+        blocks = int(np.ceil(segment_take / block_size))
+        block_lengths = [block_size] * max(0, blocks - 1)
+        block_lengths.append(segment_take - sum(block_lengths))
+        max_start = max(0, len(segment) - max(block_lengths))
+        starts = np.linspace(0, max_start, num=blocks, dtype=int)
+        for start, length in zip(starts, block_lengths, strict=True):
+            chunks.append(segment[start : start + length])
+    return chunks
+
+
 def collect_all(
     farms,
     window,
@@ -146,48 +188,67 @@ def collect_all(
     feature_columns_by_farm: dict[str, list[str]] | None = None,
     engineered_feature_columns_by_farm: dict[str, list[str]] | None = None,
     feature_profile: str = "full",
+    normal_sampling: str = "sequential",
 ):
     """Collect both VAE (flat) mats and LSTM (sequence) mats from normal data."""
+    if normal_sampling not in {"sequential", "balanced"}:
+        raise ValueError("normal_sampling must be 'sequential' or 'balanced'")
     events = load_events(OUT)
     normal_ids: dict[str, list[str]] = {}
     for r in events.itertuples():
         if r.event_label == "normal":
             normal_ids.setdefault(r.farm, []).append(str(r.event_id))
 
-    flat = []
+    normal_sequences = [
+        (farm, dataset_id)
+        for farm in farms
+        for dataset_id in normal_ids.get(farm, [])
+    ]
+    balanced_sampling = normal_sampling == "balanced" and cap > 0
+    quotas = _balanced_quotas(cap, len(normal_sequences)) if balanced_sampling else []
+    flat: list[np.ndarray] = []
     total = 0
-    for farm in farms:
-        for did in normal_ids.get(farm, []):
-            df = load_dataset(OUT, farm, did)
-            if "train_test" in df.columns:
-                df = df[df["train_test"] == "train"]
-            df = df[operating_mask(df)]
-            cols = _feature_columns(df, farm, feature_columns_by_farm)
-            for seg in contiguous_segments(df):
-                feats = engineer_features(
-                    seg,
-                    window=window,
-                    columns=cols,
-                    use_fft=use_fft,
-                    fillna="ffill",
-                    clip_sigma=5.0,
-                    feature_profile=feature_profile,
-                )
-                feats = _select_engineered_features(
-                    feats, farm, engineered_feature_columns_by_farm
-                ).dropna()
-                if len(feats) == 0:
-                    continue
-                X = feats.values.astype(np.float32)
-                X = X[: cap - total]
-                flat.append(X)
-                total += len(X)
-                if total >= cap:
-                    break
-            if total >= cap:
+    for sequence_index, (farm, did) in enumerate(normal_sequences):
+        df = load_dataset(OUT, farm, did)
+        if "train_test" in df.columns:
+            df = df[df["train_test"] == "train"]
+        df = df[operating_mask(df)]
+        cols = _feature_columns(df, farm, feature_columns_by_farm)
+        sequence_segments: list[np.ndarray] = []
+        for seg in contiguous_segments(df):
+            feats = engineer_features(
+                seg,
+                window=window,
+                columns=cols,
+                use_fft=use_fft,
+                fillna="ffill",
+                clip_sigma=5.0,
+                feature_profile=feature_profile,
+            )
+            feats = _select_engineered_features(
+                feats, farm, engineered_feature_columns_by_farm
+            ).dropna()
+            if len(feats) == 0:
+                continue
+            X = feats.values.astype(np.float32)
+            if balanced_sampling:
+                sequence_segments.append(X)
+                continue
+            X = X[: cap - total] if cap else X
+            flat.append(X)
+            total += len(X)
+            if cap and total >= cap:
                 break
-        if total >= cap:
+        if balanced_sampling:
+            selected = _contiguous_balanced_chunks(sequence_segments, quotas[sequence_index])
+            flat.extend(selected)
+            total += sum(len(chunk) for chunk in selected)
+        if cap and total >= cap and normal_sampling == "sequential":
             break
+    if not flat:
+        raise ValueError("No usable normal training features were collected")
+    if balanced_sampling and total < cap:
+        print(f"  balanced sampling collected {total}/{cap} rows; some normal sequences were short")
 
     train_mats, val_mats = split_train_validation(flat, validation_fraction)
     X_all = np.concatenate(train_mats, axis=0)

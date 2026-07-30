@@ -52,6 +52,12 @@ def main() -> None:
     parser.add_argument("--window", type=int, default=576)
     parser.add_argument("--seq-len", type=int, default=96)
     parser.add_argument("--cap-train", type=int, default=60000)
+    parser.add_argument(
+        "--normal-sampling",
+        choices=["sequential", "balanced"],
+        default="sequential",
+        help="Sequential cap or balanced contiguous blocks across normal datasets.",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--threshold-percentile", type=float, default=99.0)
     parser.add_argument(
@@ -160,6 +166,7 @@ def main() -> None:
         columns,
         engineered_columns,
         args.feature_profile,
+        args.normal_sampling,
     )
     train_x, train_mats, validation_x, validation_mats, mean, std = shared
     model = TransformerAE(
@@ -264,6 +271,7 @@ def main() -> None:
         "feature_columns_by_farm": columns,
         "engineered_feature_list": str(args.feature_list) if args.feature_list else None,
         "window": args.window,
+        "normal_sampling": args.normal_sampling,
         "seq_len": args.seq_len,
         "use_fft": use_fft,
         "in_dim": int(train_x.shape[1]),

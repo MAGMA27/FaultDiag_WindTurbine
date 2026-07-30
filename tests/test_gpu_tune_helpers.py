@@ -120,3 +120,18 @@ def test_sequence_inputs_align_with_window_scores():
     assert inputs.shape == (6, 3)
     assert np.array_equal(inputs[0], matrix[2])
     assert scores.shape == (6,)
+
+
+def test_balanced_sampling_assigns_equal_sequence_quotas():
+    assert GPU_TUNE._balanced_quotas(10, 3) == [4, 3, 3]
+
+
+def test_balanced_chunks_preserve_contiguity_and_budget():
+    segment_a = np.arange(30, dtype=np.float32).reshape(-1, 1)
+    segment_b = np.arange(100, 130, dtype=np.float32).reshape(-1, 1)
+
+    chunks = GPU_TUNE._contiguous_balanced_chunks([segment_a, segment_b], quota=12, block_size=4)
+
+    assert sum(len(chunk) for chunk in chunks) == 12
+    for chunk in chunks:
+        assert np.all(np.diff(chunk[:, 0]) == 1)

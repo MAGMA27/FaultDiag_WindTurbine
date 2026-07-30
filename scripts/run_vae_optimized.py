@@ -70,6 +70,12 @@ def main() -> None:
     )
     parser.add_argument("--window", type=int, default=96)
     parser.add_argument("--cap-train", type=int, default=60000)
+    parser.add_argument(
+        "--normal-sampling",
+        choices=["sequential", "balanced"],
+        default="sequential",
+        help="Sequential cap or balanced contiguous blocks across normal datasets.",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--threshold-percentile", type=float, default=99.0)
     parser.add_argument(
@@ -137,6 +143,7 @@ def main() -> None:
         args.validation_fraction,
         use_fft,
         configured_columns,
+        normal_sampling=args.normal_sampling,
     )
     train_x, _, validation_x, _, mean, std = shared
     model = VAE(train_x.shape[1], latent=args.latent, hidden=args.hidden, beta=args.beta)
@@ -224,6 +231,7 @@ def main() -> None:
         "feature_set": args.feature_set,
         "feature_columns_by_farm": configured_columns,
         "window": args.window,
+        "normal_sampling": args.normal_sampling,
         "use_fft": use_fft,
         "in_dim": int(train_x.shape[1]),
         "hidden": args.hidden,
