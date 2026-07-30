@@ -77,18 +77,22 @@ class VAE(nn.Module):
         """Return per-sample anomaly scores.
 
         `sum` preserves the original Eq. 11 implementation. `mean` matches the
-        LSTM/Transformer MSE scale and avoids feature-count dominated scores.
+        LSTM/Transformer MSE scale. `l2` matches the CARE adaptive-AE baseline's
+        per-row reconstruction norm for its threshold network.
         """
-        if reduction not in {"sum", "mean"}:
-            raise ValueError("reduction must be 'sum' or 'mean'")
+        if reduction not in {"sum", "mean", "l2"}:
+            raise ValueError("reduction must be 'sum', 'mean', or 'l2'")
         self.eval()
         mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar, sample=not deterministic)
         recon = self.decode(z)
         squared_error = (recon - x) ** 2
-        per_sample_recon = (
-            squared_error.mean(dim=1) if reduction == "mean" else squared_error.sum(dim=1)
-        )
+        if reduction == "mean":
+            per_sample_recon = squared_error.mean(dim=1)
+        elif reduction == "sum":
+            per_sample_recon = squared_error.sum(dim=1)
+        else:
+            per_sample_recon = torch.linalg.vector_norm(recon - x, dim=1)
         if not include_kld:
             return self.alpha * per_sample_recon
         per_sample_kld = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)

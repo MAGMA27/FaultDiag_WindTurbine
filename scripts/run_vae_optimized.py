@@ -113,7 +113,7 @@ def main() -> None:
     )
     parser.add_argument("--patience", type=int, default=60)
     parser.add_argument("--min-delta", type=float, default=1e-4)
-    parser.add_argument("--score-reduction", choices=["sum", "mean"], default="mean")
+    parser.add_argument("--score-reduction", choices=["sum", "mean", "l2"], default="mean")
     parser.add_argument("--no-kld-score", action="store_true")
     parser.add_argument("--seed", type=int, default=20260717)
     parser.add_argument("--device", default=gpu.DEVICE)

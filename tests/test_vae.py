@@ -15,6 +15,16 @@ def test_vae_forward_and_loss():
     assert torch.isfinite(loss)
 
 
+def test_vae_l2_score_matches_reconstruction_norm():
+    model = VAE(in_dim=3, latent=2, hidden=4)
+    x = torch.randn(5, 3)
+    with torch.no_grad():
+        mu, _ = model.encode(x)
+        expected = torch.linalg.vector_norm(model.decode(mu) - x, dim=1)
+        actual = model.reconstruction_error(x, reduction="l2", include_kld=False)
+    assert torch.allclose(actual, expected)
+
+
 def test_vae_train_runs():
     torch.manual_seed(0)
     X = np.random.randn(200, 10).astype("float32")
