@@ -10,6 +10,7 @@ Key departures from the CPU scripts:
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import json
 import random
@@ -898,6 +899,15 @@ def train_seq_gpu(
     if best_state is None:
         raise RuntimeError("Sequence training failed before producing a finite checkpoint")
     model.load_state_dict(best_state)
+    # A RAM window cache can occupy most of a 32 GB host.  Persistent DataLoader
+    # workers otherwise keep the dataset alive into post-training scoring, where
+    # threshold fitting and full prediction evaluation add another memory peak.
+    for loader in (dl, val_dl):
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is not None:
+            iterator._shutdown_workers()
+    del dl, val_dl, ds, val_ds
+    gc.collect()
     return losses, best_epoch, best_val_loss
 
 
