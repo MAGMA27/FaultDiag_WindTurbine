@@ -64,6 +64,18 @@ def main() -> None:
         default="sequential",
         help="Sequential cap or balanced contiguous blocks across normal datasets.",
     )
+    parser.add_argument(
+        "--normalization",
+        choices=["global", "per_asset"],
+        default="global",
+        help="Global or turbine-specific normal-data Z-score baseline for raw CARE input.",
+    )
+    parser.add_argument(
+        "--asset-z-clip",
+        type=float,
+        default=10.0,
+        help="Symmetric post-standardization clip used with per-asset normalization.",
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.15)
     parser.add_argument("--threshold-percentile", type=float, default=99.0)
     parser.add_argument(
@@ -140,6 +152,10 @@ def main() -> None:
         raise SystemExit("--input-profile care_raw requires --feature-set all")
     if args.input_profile == "care_raw" and args.feature_list is not None:
         raise SystemExit("--input-profile care_raw cannot be combined with --feature-list")
+    if args.normalization == "per_asset" and args.input_profile != "care_raw":
+        raise SystemExit("--normalization per_asset currently requires --input-profile care_raw")
+    if args.asset_z_clip <= 0:
+        raise SystemExit("--asset-z-clip must be positive")
     if args.no_window_cache and args.ram_window_cache:
         raise SystemExit("--no-window-cache and --ram-window-cache cannot be combined")
 
@@ -163,20 +179,32 @@ def main() -> None:
     start = time.time()
     print(
         f"Transformer optimize: farms={args.farms} feature_set={args.feature_set} "
-        f"profile={args.input_profile}/{args.feature_profile} window={args.window} "
+        f"profile={args.input_profile}/{args.normalization} window={args.window} "
         f"seq_len={args.seq_len} "
         f"architecture={args.architecture}",
         flush=True,
     )
+    asset_standardizers = None
     if args.input_profile == "care_raw":
-        shared = gpu.collect_raw_normal_sequences(
-            farms,
-            args.cap_train,
-            args.validation_fraction,
-            columns,
-            args.normal_sampling,
-            args.seq_len + 1,
-        )
+        if args.normalization == "per_asset":
+            *shared, asset_standardizers = gpu.collect_raw_normal_sequences_per_asset(
+                farms,
+                args.cap_train,
+                args.validation_fraction,
+                columns,
+                args.normal_sampling,
+                args.seq_len + 1,
+                args.asset_z_clip,
+            )
+        else:
+            shared = gpu.collect_raw_normal_sequences(
+                farms,
+                args.cap_train,
+                args.validation_fraction,
+                columns,
+                args.normal_sampling,
+                args.seq_len + 1,
+            )
     else:
         shared = gpu.collect_all(
             farms,
@@ -270,6 +298,8 @@ def main() -> None:
         threshold_model=threshold_model,
         threshold_batch=args.threshold_batch,
         raw_input=args.input_profile == "care_raw",
+        asset_standardizers=asset_standardizers,
+        asset_z_clip=args.asset_z_clip if asset_standardizers is not None else None,
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
     events = load_events(OUT)
@@ -284,13 +314,20 @@ def main() -> None:
     if threshold_model is not None:
         threshold_checkpoint = CHECKPOINTS / f"{stamp}_transformer_optimized_adaptive_threshold.pt"
         torch.save(threshold_model.state_dict(), threshold_checkpoint)
-    np.savez(norm_path, mean=mean, std=std)
+    normalization_payload = {"mean": mean, "std": std}
+    if asset_standardizers is not None:
+        for asset, (asset_mean, asset_std) in asset_standardizers.items():
+            normalization_payload[f"asset_{asset}_mean"] = asset_mean
+            normalization_payload[f"asset_{asset}_std"] = asset_std
+    np.savez(norm_path, **normalization_payload)
     result = {
         "model": "transformer_optimized",
         "farms": farms,
         "feature_set": args.feature_set,
         "input_profile": args.input_profile,
         "feature_profile": args.feature_profile,
+        "normalization_mode": args.normalization,
+        "asset_z_clip": args.asset_z_clip if asset_standardizers is not None else None,
         "feature_columns_by_farm": columns,
         "engineered_feature_list": str(args.feature_list) if args.feature_list else None,
         "window": args.window,

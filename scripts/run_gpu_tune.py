@@ -465,6 +465,123 @@ def collect_raw_normal_sequences(
     return np.concatenate(zmats), zmats, np.concatenate(zval_mats), zval_mats, mean, std
 
 
+def collect_raw_normal_sequences_per_asset(
+    farms: list[str],
+    cap: int,
+    validation_fraction: float,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+    normal_sampling: str = "balanced",
+    min_segment_length: int = 1,
+    z_clip: float = 10.0,
+) -> tuple[
+    np.ndarray,
+    list[np.ndarray],
+    np.ndarray,
+    list[np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    dict[str, tuple[np.ndarray, np.ndarray]],
+]:
+    """Collect raw normal sequences standardized with a separate baseline per asset."""
+    if len(farms) != 1:
+        raise ValueError("per-asset raw sequence input currently requires exactly one farm")
+    if normal_sampling not in {"sequential", "balanced"}:
+        raise ValueError("normal_sampling must be 'sequential' or 'balanced'")
+    if min_segment_length <= 0 or z_clip <= 0:
+        raise ValueError("min_segment_length and z_clip must be positive")
+
+    farm = farms[0]
+    events = load_events(OUT)
+    normal_ids = events[(events["farm"] == farm) & (events["event_label"] == "normal")][
+        "event_id"
+    ].astype(str).tolist()
+    balanced_sampling = normal_sampling == "balanced" and cap > 0
+    quotas = _balanced_quotas(cap, len(normal_ids)) if balanced_sampling else []
+    raw_mats: list[np.ndarray] = []
+    asset_mats: list[np.ndarray] = []
+    total = 0
+    for sequence_index, dataset_id in enumerate(normal_ids):
+        frame = load_dataset(OUT, farm, dataset_id)
+        frame = frame[(frame["train_test"] == "train") & operating_mask(frame)].copy()
+        columns = _feature_columns(frame, farm, feature_columns_by_farm)
+        values = frame.loc[:, columns].replace([np.inf, -np.inf], np.nan)
+        frame.loc[:, columns] = values
+        segments = [
+            segment for segment in contiguous_segments(frame) if len(segment) >= min_segment_length
+        ]
+        raw_segments = [segment.loc[:, columns].to_numpy(dtype=np.float32) for segment in segments]
+        asset_segments = [segment["asset_id"].astype(str).to_numpy() for segment in segments]
+        if balanced_sampling:
+            selected = _contiguous_balanced_chunks(
+                raw_segments, quotas[sequence_index], min_chunk_length=min_segment_length
+            )
+            for chunk in selected:
+                # Chunks preserve source order; recover their source slice without copying.
+                for raw_segment, asset_segment in zip(raw_segments, asset_segments, strict=True):
+                    if len(chunk) <= len(raw_segment) and np.shares_memory(chunk, raw_segment):
+                        offset = (
+                            chunk.__array_interface__["data"][0]
+                            - raw_segment.__array_interface__["data"][0]
+                        ) // raw_segment.strides[0]
+                        raw_mats.append(chunk)
+                        asset_mats.append(asset_segment[offset : offset + len(chunk)])
+                        total += len(chunk)
+                        break
+            continue
+        for raw_segment, asset_segment in zip(raw_segments, asset_segments, strict=True):
+            selected = raw_segment[: cap - total] if cap else raw_segment
+            raw_mats.append(selected)
+            asset_mats.append(asset_segment[: len(selected)])
+            total += len(selected)
+            if cap and total >= cap:
+                break
+        if cap and total >= cap:
+            break
+    if not raw_mats:
+        raise ValueError("No usable normal raw sequence rows were collected")
+    if balanced_sampling and total < cap:
+        print(f"  balanced raw sequence sampling collected {total}/{cap} rows")
+
+    all_raw = np.concatenate(raw_mats, axis=0)
+    global_fill = np.nanmedian(all_raw, axis=0)
+    global_fill = np.nan_to_num(global_fill, nan=0.0, posinf=0.0, neginf=0.0)
+    raw_mats = [
+        np.where(np.isfinite(matrix), matrix, global_fill).astype(np.float32)
+        for matrix in raw_mats
+    ]
+    train_mats, val_mats = split_train_validation(raw_mats, validation_fraction)
+    train_assets, val_assets = split_train_validation(asset_mats, validation_fraction)
+    train_raw = np.concatenate(train_mats, axis=0)
+    train_asset_ids = np.concatenate(train_assets)
+    normalizers: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for asset in np.unique(train_asset_ids):
+        normalizers[str(asset)] = fit_standardizer(train_raw[train_asset_ids == asset])
+
+    def standardize(matrices: list[np.ndarray], assets: list[np.ndarray]) -> list[np.ndarray]:
+        result: list[np.ndarray] = []
+        for matrix, asset_ids in zip(matrices, assets, strict=True):
+            z = np.empty(matrix.shape, dtype=np.float32)
+            for asset in np.unique(asset_ids):
+                mean, std = normalizers[str(asset)]
+                rows = asset_ids == asset
+                z[rows] = np.clip(apply_standardizer(matrix[rows], mean, std), -z_clip, z_clip)
+            result.append(z)
+        return result
+
+    zmats = standardize(train_mats, train_assets)
+    zval_mats = standardize(val_mats, val_assets)
+    global_mean, global_std = fit_standardizer(train_raw)
+    return (
+        np.concatenate(zmats),
+        zmats,
+        np.concatenate(zval_mats),
+        zval_mats,
+        global_mean,
+        global_std,
+        normalizers,
+    )
+
+
 def _empty_prediction_records(df: pd.DataFrame, farm: str, dataset_id: str) -> pd.DataFrame:
     """Create a full status timeline; only operating timestamps receive scores."""
     records = prediction_rows(df)[["time_stamp", "status_type_id", "train_test"]].copy()
@@ -579,6 +696,8 @@ def evaluate_seq_records(
     threshold_model=None,
     threshold_batch: int = 4096,
     raw_input: bool = False,
+    asset_standardizers: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    asset_z_clip: float | None = None,
 ):
     """Score sequence windows and retain the complete prediction status timeline."""
     records_list = []
@@ -592,7 +711,24 @@ def evaluate_seq_records(
             for segment in contiguous_segments(score_df):
                 if raw_input:
                     feats = segment.loc[:, cols].replace([np.inf, -np.inf], np.nan)
-                    feats = feats.fillna(pd.Series(mean, index=cols))
+                    if asset_standardizers is None:
+                        feats = feats.fillna(pd.Series(mean, index=cols))
+                        Z = apply_standardizer(feats, mean, std).astype(np.float32)
+                    else:
+                        asset_ids = segment.loc[feats.index, "asset_id"].astype(str).to_numpy()
+                        Z = np.empty(feats.shape, dtype=np.float32)
+                        for asset in np.unique(asset_ids):
+                            if asset not in asset_standardizers:
+                                raise ValueError(
+                                    f"no normal standardizer available for asset {asset}"
+                                )
+                            asset_mean, asset_std = asset_standardizers[asset]
+                            rows = asset_ids == asset
+                            asset_feats = feats.loc[rows].fillna(pd.Series(asset_mean, index=cols))
+                            asset_z = apply_standardizer(asset_feats, asset_mean, asset_std)
+                            if asset_z_clip is not None:
+                                asset_z = np.clip(asset_z, -asset_z_clip, asset_z_clip)
+                            Z[rows] = asset_z
                 else:
                     feats = engineer_features(
                         segment,
@@ -608,7 +744,8 @@ def evaluate_seq_records(
                     ).dropna()
                 if len(feats) < seq_len:
                     continue
-                Z = apply_standardizer(feats, mean, std).astype(np.float32)
+                if not raw_input:
+                    Z = apply_standardizer(feats, mean, std).astype(np.float32)
                 ds = SeqWindowsDataset([Z], seq_len)
                 dl = DataLoader(ds, batch_size=batch, shuffle=False, pin_memory=True)
                 win_err = np.empty(len(ds), dtype=np.float32)
