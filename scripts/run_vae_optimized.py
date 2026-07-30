@@ -80,6 +80,12 @@ def main() -> None:
         default="global",
         help="One global Z-score or a normal-history Z-score for each turbine asset.",
     )
+    parser.add_argument(
+        "--asset-z-clip",
+        type=float,
+        default=10.0,
+        help="Symmetric post-standardization clip used with per-asset normalization.",
+    )
     parser.add_argument("--window", type=int, default=96)
     parser.add_argument("--cap-train", type=int, default=60000)
     parser.add_argument(
@@ -136,6 +142,8 @@ def main() -> None:
         raise SystemExit("--input-profile care_raw requires --feature-set all")
     if args.normalization == "per_asset" and args.input_profile != "care_raw":
         raise SystemExit("--normalization per_asset currently requires --input-profile care_raw")
+    if args.asset_z_clip <= 0:
+        raise SystemExit("--asset-z-clip must be positive")
 
     gpu.DEVICE = args.device
     gpu.set_seed(args.seed)
@@ -163,6 +171,7 @@ def main() -> None:
                 args.validation_fraction,
                 args.seed,
                 configured_columns,
+                args.asset_z_clip,
             )
         else:
             shared = gpu.collect_raw_normal(
@@ -247,6 +256,7 @@ def main() -> None:
         threshold_batch=args.threshold_batch,
         raw_input=args.input_profile == "care_raw",
         asset_standardizers=asset_standardizers,
+        asset_z_clip=args.asset_z_clip if asset_standardizers is not None else None,
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
 
@@ -275,6 +285,7 @@ def main() -> None:
         "feature_set": args.feature_set,
         "input_profile": args.input_profile,
         "normalization_mode": args.normalization,
+        "asset_z_clip": args.asset_z_clip if asset_standardizers is not None else None,
         "feature_columns_by_farm": configured_columns,
         "window": args.window,
         "normal_sampling": args.normal_sampling,

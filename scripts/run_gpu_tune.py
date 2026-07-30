@@ -327,6 +327,7 @@ def collect_raw_normal_per_asset(
     validation_fraction: float,
     seed: int,
     feature_columns_by_farm: dict[str, list[str]] | None = None,
+    z_clip: float = 10.0,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -339,6 +340,8 @@ def collect_raw_normal_per_asset(
     """Build a shared raw VAE dataset after fitting Z-scores per normal asset."""
     if len(farms) != 1:
         raise ValueError("per-asset raw input currently requires exactly one farm")
+    if z_clip <= 0:
+        raise ValueError("z_clip must be positive")
     farm = farms[0]
     events = load_events(OUT)
     normal_ids = events[(events["farm"] == farm) & (events["event_label"] == "normal")][
@@ -382,8 +385,14 @@ def collect_raw_normal_per_asset(
             raise ValueError(f"asset {asset} has insufficient rows for per-asset split")
         mean, std = fit_standardizer(train_raw)
         normalizers[asset] = (mean, std)
-        train_parts.append(apply_standardizer(train_raw, mean, std).astype(np.float32))
-        validation_parts.append(apply_standardizer(validation_raw, mean, std).astype(np.float32))
+        train_parts.append(
+            np.clip(apply_standardizer(train_raw, mean, std), -z_clip, z_clip).astype(np.float32)
+        )
+        validation_parts.append(
+            np.clip(apply_standardizer(validation_raw, mean, std), -z_clip, z_clip).astype(
+                np.float32
+            )
+        )
     train_x = np.concatenate(train_parts, axis=0)
     validation_x = np.concatenate(validation_parts, axis=0)
     if not np.isfinite(train_x).all() or not np.isfinite(validation_x).all():
@@ -491,6 +500,7 @@ def evaluate_vae_records(
     threshold_batch: int = 4096,
     raw_input: bool = False,
     asset_standardizers: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
+    asset_z_clip: float | None = None,
 ):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
@@ -519,7 +529,10 @@ def evaluate_vae_records(
                             asset_mean, asset_std = asset_standardizers[asset]
                             rows = asset_ids == asset
                             asset_feats = feats.loc[rows].fillna(pd.Series(asset_mean, index=cols))
-                            Z[rows] = apply_standardizer(asset_feats, asset_mean, asset_std)
+                            asset_z = apply_standardizer(asset_feats, asset_mean, asset_std)
+                            if asset_z_clip is not None:
+                                asset_z = np.clip(asset_z, -asset_z_clip, asset_z_clip)
+                            Z[rows] = asset_z
                 else:
                     feats = engineer_features(
                         segment,
