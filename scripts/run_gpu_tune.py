@@ -260,6 +260,43 @@ def collect_all(
     return vae_X, zmats, vae_val, zval_mats, mean, std
 
 
+def collect_raw_normal(
+    farms: list[str],
+    cap: int,
+    validation_fraction: float,
+    seed: int,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
+    """Collect CARE-AE-style raw rows with random normal train/validation split."""
+    if len(farms) != 1:
+        raise ValueError("care_raw input currently requires exactly one farm")
+    farm = farms[0]
+    events = load_events(OUT)
+    normal_ids = events[(events["farm"] == farm) & (events["event_label"] == "normal")][
+        "event_id"
+    ].astype(str)
+    matrices: list[np.ndarray] = []
+    for dataset_id in normal_ids:
+        frame = load_dataset(OUT, farm, dataset_id)
+        frame = frame[(frame["train_test"] == "train") & operating_mask(frame)]
+        columns = _feature_columns(frame, farm, feature_columns_by_farm)
+        values = frame.loc[:, columns].replace([np.inf, -np.inf], np.nan)
+        matrices.append(values.fillna(values.median()).to_numpy(dtype=np.float32))
+    if not matrices:
+        raise ValueError(f"no normal operating training rows available for Farm {farm}")
+    raw = np.concatenate(matrices, axis=0)
+    if cap and cap < len(raw):
+        indices = np.random.default_rng(seed).choice(len(raw), size=cap, replace=False)
+        raw = raw[indices]
+    permutation = np.random.default_rng(seed).permutation(len(raw))
+    split = round(len(raw) * (1.0 - validation_fraction))
+    train_raw, validation_raw = raw[permutation[:split]], raw[permutation[split:]]
+    mean, std = fit_standardizer(train_raw)
+    train_x = apply_standardizer(train_raw, mean, std).astype(np.float32)
+    validation_x = apply_standardizer(validation_raw, mean, std).astype(np.float32)
+    return train_x, [train_x], validation_x, [validation_x], mean, std
+
+
 def _empty_prediction_records(df: pd.DataFrame, farm: str, dataset_id: str) -> pd.DataFrame:
     """Create a full status timeline; only operating timestamps receive scores."""
     records = prediction_rows(df)[["time_stamp", "status_type_id", "train_test"]].copy()
@@ -293,6 +330,7 @@ def evaluate_vae_records(
     feature_profile: str = "full",
     threshold_model=None,
     threshold_batch: int = 4096,
+    raw_input: bool = False,
 ):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
@@ -303,16 +341,21 @@ def evaluate_vae_records(
             score_df = prediction_rows(raw_df)
             score_df = score_df[operating_mask(score_df)]
             cols = _feature_columns(score_df, farm, feature_columns_by_farm)
-            for segment in contiguous_segments(score_df):
-                feats = engineer_features(
-                    segment,
-                    window=window,
-                    columns=cols,
-                    use_fft=use_fft,
-                    fillna="ffill",
-                    clip_sigma=5.0,
-                    feature_profile=feature_profile,
-                ).dropna()
+            segments = [score_df] if raw_input else contiguous_segments(score_df)
+            for segment in segments:
+                if raw_input:
+                    feats = segment.loc[:, cols].replace([np.inf, -np.inf], np.nan)
+                    feats = feats.fillna(pd.Series(mean, index=cols))
+                else:
+                    feats = engineer_features(
+                        segment,
+                        window=window,
+                        columns=cols,
+                        use_fft=use_fft,
+                        fillna="ffill",
+                        clip_sigma=5.0,
+                        feature_profile=feature_profile,
+                    ).dropna()
                 if len(feats) == 0:
                     continue
                 Z = apply_standardizer(feats, mean, std).astype(np.float32)

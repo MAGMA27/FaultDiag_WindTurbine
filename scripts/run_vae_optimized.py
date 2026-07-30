@@ -68,6 +68,12 @@ def main() -> None:
     parser.add_argument(
         "--feature-set", choices=["all", "avg_only", "paper_top"], default="avg_only"
     )
+    parser.add_argument(
+        "--input-profile",
+        choices=["windowed", "care_raw"],
+        default="windowed",
+        help="Window-engineered vectors or raw CARE-AE-compatible SCADA rows.",
+    )
     parser.add_argument("--window", type=int, default=96)
     parser.add_argument("--cap-train", type=int, default=60000)
     parser.add_argument(
@@ -120,6 +126,8 @@ def main() -> None:
         raise SystemExit("--validation-fraction must be between 0 and 1")
     if not 95 <= args.threshold_percentile <= 99:
         raise SystemExit("--threshold-percentile must be between 95 and 99")
+    if args.input_profile == "care_raw" and args.feature_set != "all":
+        raise SystemExit("--input-profile care_raw requires --feature-set all")
 
     gpu.DEVICE = args.device
     gpu.set_seed(args.seed)
@@ -133,18 +141,28 @@ def main() -> None:
 
     print(
         f"VAE optimize: farms={args.farms} feature_set={args.feature_set} "
-        f"window={args.window} epochs={args.epochs} scheduler={args.scheduler}",
+        f"profile={args.input_profile} window={args.window} epochs={args.epochs} "
+        f"scheduler={args.scheduler}",
         flush=True,
     )
-    shared = gpu.collect_all(
-        farms,
-        args.window,
-        args.cap_train,
-        args.validation_fraction,
-        use_fft,
-        configured_columns,
-        normal_sampling=args.normal_sampling,
-    )
+    if args.input_profile == "care_raw":
+        shared = gpu.collect_raw_normal(
+            farms,
+            args.cap_train,
+            args.validation_fraction,
+            args.seed,
+            configured_columns,
+        )
+    else:
+        shared = gpu.collect_all(
+            farms,
+            args.window,
+            args.cap_train,
+            args.validation_fraction,
+            use_fft,
+            configured_columns,
+            normal_sampling=args.normal_sampling,
+        )
     train_x, _, validation_x, _, mean, std = shared
     model = VAE(train_x.shape[1], latent=args.latent, hidden=args.hidden, beta=args.beta)
     loss_path = RESULTS / f"{stamp}_vae_optimized_loss.txt"
@@ -208,6 +226,7 @@ def main() -> None:
         include_kld=include_kld,
         threshold_model=threshold_model,
         threshold_batch=args.threshold_batch,
+        raw_input=args.input_profile == "care_raw",
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
 
@@ -229,6 +248,7 @@ def main() -> None:
         "model": "vae_optimized",
         "farms": farms,
         "feature_set": args.feature_set,
+        "input_profile": args.input_profile,
         "feature_columns_by_farm": configured_columns,
         "window": args.window,
         "normal_sampling": args.normal_sampling,
