@@ -357,6 +357,13 @@ def collect_raw_normal_per_asset(
         raise ValueError(f"no normal operating training rows available for Farm {farm}")
     raw = np.concatenate(feature_rows, axis=0)
     assets = np.concatenate(asset_rows)
+    # A sensor can be entirely missing for one turbine even though it exists on
+    # other turbines.  Per-dataset median filling leaves such a column NaN;
+    # use the all-normal asset median as a neutral fallback before fitting each
+    # asset's own Z-score (it then becomes a constant zero for that asset).
+    global_fill = np.nanmedian(raw, axis=0)
+    global_fill = np.nan_to_num(global_fill, nan=0.0, posinf=0.0, neginf=0.0)
+    raw = np.where(np.isfinite(raw), raw, global_fill).astype(np.float32)
     if cap and cap < len(raw):
         indices = np.random.default_rng(seed).choice(len(raw), size=cap, replace=False)
         raw, assets = raw[indices], assets[indices]
@@ -379,6 +386,8 @@ def collect_raw_normal_per_asset(
         validation_parts.append(apply_standardizer(validation_raw, mean, std).astype(np.float32))
     train_x = np.concatenate(train_parts, axis=0)
     validation_x = np.concatenate(validation_parts, axis=0)
+    if not np.isfinite(train_x).all() or not np.isfinite(validation_x).all():
+        raise ValueError("per-asset normalization produced non-finite values")
     global_mean, global_std = fit_standardizer(raw)
     return train_x, [train_x], validation_x, [validation_x], global_mean, global_std, normalizers
 
