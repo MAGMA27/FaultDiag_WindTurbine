@@ -488,7 +488,10 @@ def sequence_inputs_and_scores(
     errors: list[np.ndarray] = []
     with torch.inference_mode():
         for xb in loader:
-            inputs.append(xb[:, -1, :].numpy())
+            # ``numpy()`` alone would be a view into the full [B, T, D] batch.
+            # Keeping those views for every batch retains all sequence windows
+            # (tens of GB for long Transformer runs) during threshold fitting.
+            inputs.append(xb[:, -1, :].clone().numpy())
             errors.append(
                 model.reconstruction_error(xb.to(DEVICE, non_blocking=True)).cpu().numpy()
             )
