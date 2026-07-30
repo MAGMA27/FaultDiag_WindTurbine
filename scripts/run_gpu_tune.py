@@ -147,9 +147,14 @@ def _balanced_quotas(total: int, count: int) -> list[int]:
 
 
 def _contiguous_balanced_chunks(
-    segments: list[np.ndarray], quota: int, block_size: int = 4096
+    segments: list[np.ndarray],
+    quota: int,
+    block_size: int = 4096,
+    min_chunk_length: int = 1,
 ) -> list[np.ndarray]:
     """Take evenly spaced contiguous blocks without creating artificial sequences."""
+    if min_chunk_length <= 0:
+        raise ValueError("min_chunk_length must be positive")
     available = sum(len(segment) for segment in segments)
     take = min(quota, available)
     if take <= 0:
@@ -166,13 +171,31 @@ def _contiguous_balanced_chunks(
             allocation[index] += 1
             remaining -= 1
 
+    # Sequence models cannot use tiny fragments.  Move their budget to longer
+    # segments instead of emitting chunks that will later be discarded.
+    too_small = (allocation > 0) & (allocation < min_chunk_length)
+    remaining = int(allocation[too_small].sum())
+    allocation[too_small] = 0
+    for index in np.argsort(-lengths):
+        if remaining == 0:
+            break
+        capacity = int(lengths[index]) - int(allocation[index])
+        minimum = min_chunk_length if allocation[index] == 0 else 1
+        if capacity < minimum or remaining < minimum:
+            continue
+        addition = min(remaining, capacity)
+        allocation[index] += addition
+        remaining -= addition
+    if remaining:
+        raise ValueError("quota cannot be represented with the requested minimum chunk length")
+
     chunks: list[np.ndarray] = []
     for segment, segment_take in zip(segments, allocation, strict=True):
         if segment_take == 0:
             continue
         blocks = int(np.ceil(segment_take / block_size))
-        block_lengths = [block_size] * max(0, blocks - 1)
-        block_lengths.append(segment_take - sum(block_lengths))
+        base_length, extra = divmod(int(segment_take), blocks)
+        block_lengths = [base_length + int(index < extra) for index in range(blocks)]
         max_start = max(0, len(segment) - max(block_lengths))
         starts = np.linspace(0, max_start, num=blocks, dtype=int)
         for start, length in zip(starts, block_lengths, strict=True):
@@ -298,6 +321,70 @@ def collect_raw_normal(
     return train_x, [train_x], validation_x, [validation_x], mean, std
 
 
+def collect_raw_normal_sequences(
+    farms: list[str],
+    cap: int,
+    validation_fraction: float,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+    normal_sampling: str = "balanced",
+    min_segment_length: int = 1,
+) -> tuple[np.ndarray, list[np.ndarray], np.ndarray, list[np.ndarray], np.ndarray, np.ndarray]:
+    """Collect raw contiguous normal SCADA blocks for CARE-aligned sequence models."""
+    if len(farms) != 1:
+        raise ValueError("care_raw sequence input currently requires exactly one farm")
+    if normal_sampling not in {"sequential", "balanced"}:
+        raise ValueError("normal_sampling must be 'sequential' or 'balanced'")
+    if min_segment_length <= 0:
+        raise ValueError("min_segment_length must be positive")
+    farm = farms[0]
+    events = load_events(OUT)
+    normal_ids = events[(events["farm"] == farm) & (events["event_label"] == "normal")][
+        "event_id"
+    ].astype(str).tolist()
+    balanced_sampling = normal_sampling == "balanced" and cap > 0
+    quotas = _balanced_quotas(cap, len(normal_ids)) if balanced_sampling else []
+    raw_mats: list[np.ndarray] = []
+    total = 0
+    for sequence_index, dataset_id in enumerate(normal_ids):
+        frame = load_dataset(OUT, farm, dataset_id)
+        frame = frame[(frame["train_test"] == "train") & operating_mask(frame)].copy()
+        columns = _feature_columns(frame, farm, feature_columns_by_farm)
+        values = frame.loc[:, columns].replace([np.inf, -np.inf], np.nan)
+        frame.loc[:, columns] = values.fillna(values.median())
+        sequence_segments = [
+            segment.loc[:, columns].to_numpy(dtype=np.float32)
+            for segment in contiguous_segments(frame)
+            if len(segment) >= min_segment_length
+        ]
+        if balanced_sampling:
+            selected = _contiguous_balanced_chunks(
+                sequence_segments,
+                quotas[sequence_index],
+                min_chunk_length=min_segment_length,
+            )
+            raw_mats.extend(selected)
+            total += sum(len(chunk) for chunk in selected)
+            continue
+        for segment in sequence_segments:
+            selected = segment[: cap - total] if cap else segment
+            raw_mats.append(selected)
+            total += len(selected)
+            if cap and total >= cap:
+                break
+        if cap and total >= cap:
+            break
+    if not raw_mats:
+        raise ValueError("No usable normal raw sequence rows were collected")
+    if balanced_sampling and total < cap:
+        print(f"  balanced raw sequence sampling collected {total}/{cap} rows")
+    train_mats, val_mats = split_train_validation(raw_mats, validation_fraction)
+    train_raw = np.concatenate(train_mats, axis=0)
+    mean, std = fit_standardizer(train_raw)
+    zmats = [apply_standardizer(matrix, mean, std).astype(np.float32) for matrix in train_mats]
+    zval_mats = [apply_standardizer(matrix, mean, std).astype(np.float32) for matrix in val_mats]
+    return np.concatenate(zmats), zmats, np.concatenate(zval_mats), zval_mats, mean, std
+
+
 def _empty_prediction_records(df: pd.DataFrame, farm: str, dataset_id: str) -> pd.DataFrame:
     """Create a full status timeline; only operating timestamps receive scores."""
     records = prediction_rows(df)[["time_stamp", "status_type_id", "train_test"]].copy()
@@ -391,6 +478,7 @@ def evaluate_seq_records(
     feature_profile: str = "full",
     threshold_model=None,
     threshold_batch: int = 4096,
+    raw_input: bool = False,
 ):
     """Score sequence windows and retain the complete prediction status timeline."""
     records_list = []
@@ -402,18 +490,22 @@ def evaluate_seq_records(
             score_df = score_df[operating_mask(score_df)]
             cols = _feature_columns(score_df, farm, feature_columns_by_farm)
             for segment in contiguous_segments(score_df):
-                feats = engineer_features(
-                    segment,
-                    window=window,
-                    columns=cols,
-                    use_fft=use_fft,
-                    fillna="ffill",
-                    clip_sigma=5.0,
-                    feature_profile=feature_profile,
-                )
-                feats = _select_engineered_features(
-                    feats, farm, engineered_feature_columns_by_farm
-                ).dropna()
+                if raw_input:
+                    feats = segment.loc[:, cols].replace([np.inf, -np.inf], np.nan)
+                    feats = feats.fillna(pd.Series(mean, index=cols))
+                else:
+                    feats = engineer_features(
+                        segment,
+                        window=window,
+                        columns=cols,
+                        use_fft=use_fft,
+                        fillna="ffill",
+                        clip_sigma=5.0,
+                        feature_profile=feature_profile,
+                    )
+                    feats = _select_engineered_features(
+                        feats, farm, engineered_feature_columns_by_farm
+                    ).dropna()
                 if len(feats) < seq_len:
                     continue
                 Z = apply_standardizer(feats, mean, std).astype(np.float32)

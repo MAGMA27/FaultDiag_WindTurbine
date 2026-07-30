@@ -39,6 +39,12 @@ def main() -> None:
         "--feature-set", choices=["all", "avg_only", "paper_top"], default="avg_only"
     )
     parser.add_argument(
+        "--input-profile",
+        choices=["windowed", "care_raw"],
+        default="windowed",
+        help="Window-engineered features or raw CARE-aligned SCADA sequences.",
+    )
+    parser.add_argument(
         "--feature-profile",
         choices=["full", "stat_aware", "raw_stat_compact"],
         default="full",
@@ -130,6 +136,10 @@ def main() -> None:
         raise SystemExit("--d-model must be divisible by --nhead")
     if args.feature_list is not None and args.feature_profile != "full":
         raise SystemExit("--feature-list and a non-full --feature-profile cannot be combined")
+    if args.input_profile == "care_raw" and args.feature_set != "all":
+        raise SystemExit("--input-profile care_raw requires --feature-set all")
+    if args.input_profile == "care_raw" and args.feature_list is not None:
+        raise SystemExit("--input-profile care_raw cannot be combined with --feature-list")
     if args.no_window_cache and args.ram_window_cache:
         raise SystemExit("--no-window-cache and --ram-window-cache cannot be combined")
 
@@ -153,21 +163,32 @@ def main() -> None:
     start = time.time()
     print(
         f"Transformer optimize: farms={args.farms} feature_set={args.feature_set} "
-        f"profile={args.feature_profile} window={args.window} seq_len={args.seq_len} "
+        f"profile={args.input_profile}/{args.feature_profile} window={args.window} "
+        f"seq_len={args.seq_len} "
         f"architecture={args.architecture}",
         flush=True,
     )
-    shared = gpu.collect_all(
-        farms,
-        args.window,
-        args.cap_train,
-        args.validation_fraction,
-        use_fft,
-        columns,
-        engineered_columns,
-        args.feature_profile,
-        args.normal_sampling,
-    )
+    if args.input_profile == "care_raw":
+        shared = gpu.collect_raw_normal_sequences(
+            farms,
+            args.cap_train,
+            args.validation_fraction,
+            columns,
+            args.normal_sampling,
+            args.seq_len + 1,
+        )
+    else:
+        shared = gpu.collect_all(
+            farms,
+            args.window,
+            args.cap_train,
+            args.validation_fraction,
+            use_fft,
+            columns,
+            engineered_columns,
+            args.feature_profile,
+            args.normal_sampling,
+        )
     train_x, train_mats, validation_x, validation_mats, mean, std = shared
     model = TransformerAE(
         train_x.shape[1],
@@ -248,6 +269,7 @@ def main() -> None:
         feature_profile=args.feature_profile,
         threshold_model=threshold_model,
         threshold_batch=args.threshold_batch,
+        raw_input=args.input_profile == "care_raw",
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
     events = load_events(OUT)
@@ -267,6 +289,7 @@ def main() -> None:
         "model": "transformer_optimized",
         "farms": farms,
         "feature_set": args.feature_set,
+        "input_profile": args.input_profile,
         "feature_profile": args.feature_profile,
         "feature_columns_by_farm": columns,
         "engineered_feature_list": str(args.feature_list) if args.feature_list else None,

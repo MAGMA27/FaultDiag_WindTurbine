@@ -135,3 +135,15 @@ def test_balanced_chunks_preserve_contiguity_and_budget():
     assert sum(len(chunk) for chunk in chunks) == 12
     for chunk in chunks:
         assert np.all(np.diff(chunk[:, 0]) == 1)
+
+
+def test_balanced_chunks_redistribute_tiny_sequence_fragments():
+    segment_a = np.arange(20, dtype=np.float32).reshape(-1, 1)
+    segment_b = np.arange(100, 120, dtype=np.float32).reshape(-1, 1)
+
+    chunks = GPU_TUNE._contiguous_balanced_chunks(
+        [segment_a, segment_b], quota=12, min_chunk_length=5
+    )
+
+    assert sum(len(chunk) for chunk in chunks) == 12
+    assert all(len(chunk) >= 5 for chunk in chunks)
