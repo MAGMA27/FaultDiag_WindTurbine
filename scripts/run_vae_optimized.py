@@ -74,6 +74,12 @@ def main() -> None:
         default="windowed",
         help="Window-engineered vectors or raw CARE-AE-compatible SCADA rows.",
     )
+    parser.add_argument(
+        "--normalization",
+        choices=["global", "per_asset"],
+        default="global",
+        help="One global Z-score or a normal-history Z-score for each turbine asset.",
+    )
     parser.add_argument("--window", type=int, default=96)
     parser.add_argument("--cap-train", type=int, default=60000)
     parser.add_argument(
@@ -128,6 +134,8 @@ def main() -> None:
         raise SystemExit("--threshold-percentile must be between 95 and 99")
     if args.input_profile == "care_raw" and args.feature_set != "all":
         raise SystemExit("--input-profile care_raw requires --feature-set all")
+    if args.normalization == "per_asset" and args.input_profile != "care_raw":
+        raise SystemExit("--normalization per_asset currently requires --input-profile care_raw")
 
     gpu.DEVICE = args.device
     gpu.set_seed(args.seed)
@@ -141,18 +149,29 @@ def main() -> None:
 
     print(
         f"VAE optimize: farms={args.farms} feature_set={args.feature_set} "
-        f"profile={args.input_profile} window={args.window} epochs={args.epochs} "
+        f"profile={args.input_profile}/{args.normalization} window={args.window} "
+        f"epochs={args.epochs} "
         f"scheduler={args.scheduler}",
         flush=True,
     )
+    asset_standardizers = None
     if args.input_profile == "care_raw":
-        shared = gpu.collect_raw_normal(
-            farms,
-            args.cap_train,
-            args.validation_fraction,
-            args.seed,
-            configured_columns,
-        )
+        if args.normalization == "per_asset":
+            *shared, asset_standardizers = gpu.collect_raw_normal_per_asset(
+                farms,
+                args.cap_train,
+                args.validation_fraction,
+                args.seed,
+                configured_columns,
+            )
+        else:
+            shared = gpu.collect_raw_normal(
+                farms,
+                args.cap_train,
+                args.validation_fraction,
+                args.seed,
+                configured_columns,
+            )
     else:
         shared = gpu.collect_all(
             farms,
@@ -227,6 +246,7 @@ def main() -> None:
         threshold_model=threshold_model,
         threshold_batch=args.threshold_batch,
         raw_input=args.input_profile == "care_raw",
+        asset_standardizers=asset_standardizers,
     )
     records["is_alarm"] = flag(records["score"].fillna(-np.inf).to_numpy(), threshold).astype(bool)
 
@@ -242,13 +262,19 @@ def main() -> None:
     if threshold_model is not None:
         threshold_checkpoint = CHECKPOINTS / f"{stamp}_vae_optimized_adaptive_threshold.pt"
         torch.save(threshold_model.state_dict(), threshold_checkpoint)
-    np.savez(norm_path, mean=mean, std=std)
+    normalization_payload = {"mean": mean, "std": std}
+    if asset_standardizers is not None:
+        for asset, (asset_mean, asset_std) in asset_standardizers.items():
+            normalization_payload[f"asset_{asset}_mean"] = asset_mean
+            normalization_payload[f"asset_{asset}_std"] = asset_std
+    np.savez(norm_path, **normalization_payload)
 
     result = {
         "model": "vae_optimized",
         "farms": farms,
         "feature_set": args.feature_set,
         "input_profile": args.input_profile,
+        "normalization_mode": args.normalization,
         "feature_columns_by_farm": configured_columns,
         "window": args.window,
         "normal_sampling": args.normal_sampling,

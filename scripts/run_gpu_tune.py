@@ -321,6 +321,68 @@ def collect_raw_normal(
     return train_x, [train_x], validation_x, [validation_x], mean, std
 
 
+def collect_raw_normal_per_asset(
+    farms: list[str],
+    cap: int,
+    validation_fraction: float,
+    seed: int,
+    feature_columns_by_farm: dict[str, list[str]] | None = None,
+) -> tuple[
+    np.ndarray,
+    list[np.ndarray],
+    np.ndarray,
+    list[np.ndarray],
+    np.ndarray,
+    np.ndarray,
+    dict[str, tuple[np.ndarray, np.ndarray]],
+]:
+    """Build a shared raw VAE dataset after fitting Z-scores per normal asset."""
+    if len(farms) != 1:
+        raise ValueError("per-asset raw input currently requires exactly one farm")
+    farm = farms[0]
+    events = load_events(OUT)
+    normal_ids = events[(events["farm"] == farm) & (events["event_label"] == "normal")][
+        "event_id"
+    ].astype(str)
+    feature_rows: list[np.ndarray] = []
+    asset_rows: list[np.ndarray] = []
+    for dataset_id in normal_ids:
+        frame = load_dataset(OUT, farm, dataset_id)
+        frame = frame[(frame["train_test"] == "train") & operating_mask(frame)]
+        columns = _feature_columns(frame, farm, feature_columns_by_farm)
+        values = frame.loc[:, columns].replace([np.inf, -np.inf], np.nan)
+        feature_rows.append(values.fillna(values.median()).to_numpy(dtype=np.float32))
+        asset_rows.append(frame["asset_id"].astype(str).to_numpy())
+    if not feature_rows:
+        raise ValueError(f"no normal operating training rows available for Farm {farm}")
+    raw = np.concatenate(feature_rows, axis=0)
+    assets = np.concatenate(asset_rows)
+    if cap and cap < len(raw):
+        indices = np.random.default_rng(seed).choice(len(raw), size=cap, replace=False)
+        raw, assets = raw[indices], assets[indices]
+
+    rng = np.random.default_rng(seed)
+    train_parts: list[np.ndarray] = []
+    validation_parts: list[np.ndarray] = []
+    normalizers: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for asset in sorted(np.unique(assets)):
+        asset_raw = raw[assets == asset]
+        permutation = rng.permutation(len(asset_raw))
+        split = round(len(asset_raw) * (1.0 - validation_fraction))
+        train_raw = asset_raw[permutation[:split]]
+        validation_raw = asset_raw[permutation[split:]]
+        if len(train_raw) == 0 or len(validation_raw) == 0:
+            raise ValueError(f"asset {asset} has insufficient rows for per-asset split")
+        mean, std = fit_standardizer(train_raw)
+        normalizers[asset] = (mean, std)
+        train_parts.append(apply_standardizer(train_raw, mean, std).astype(np.float32))
+        validation_parts.append(apply_standardizer(validation_raw, mean, std).astype(np.float32))
+    train_x = np.concatenate(train_parts, axis=0)
+    validation_x = np.concatenate(validation_parts, axis=0)
+    global_mean, global_std = fit_standardizer(raw)
+    return train_x, [train_x], validation_x, [validation_x], global_mean, global_std, normalizers
+
+
 def collect_raw_normal_sequences(
     farms: list[str],
     cap: int,
@@ -419,6 +481,7 @@ def evaluate_vae_records(
     threshold_model=None,
     threshold_batch: int = 4096,
     raw_input: bool = False,
+    asset_standardizers: dict[str, tuple[np.ndarray, np.ndarray]] | None = None,
 ):
     """Score operating timestamps while retaining every prediction status row for CARE."""
     records_list = []
@@ -433,7 +496,21 @@ def evaluate_vae_records(
             for segment in segments:
                 if raw_input:
                     feats = segment.loc[:, cols].replace([np.inf, -np.inf], np.nan)
-                    feats = feats.fillna(pd.Series(mean, index=cols))
+                    if asset_standardizers is None:
+                        feats = feats.fillna(pd.Series(mean, index=cols))
+                        Z = apply_standardizer(feats, mean, std).astype(np.float32)
+                    else:
+                        asset_ids = segment.loc[feats.index, "asset_id"].astype(str).to_numpy()
+                        Z = np.empty(feats.shape, dtype=np.float32)
+                        for asset in np.unique(asset_ids):
+                            if asset not in asset_standardizers:
+                                raise ValueError(
+                                    f"no normal standardizer available for asset {asset}"
+                                )
+                            asset_mean, asset_std = asset_standardizers[asset]
+                            rows = asset_ids == asset
+                            asset_feats = feats.loc[rows].fillna(pd.Series(asset_mean, index=cols))
+                            Z[rows] = apply_standardizer(asset_feats, asset_mean, asset_std)
                 else:
                     feats = engineer_features(
                         segment,
@@ -446,7 +523,8 @@ def evaluate_vae_records(
                     ).dropna()
                 if len(feats) == 0:
                     continue
-                Z = apply_standardizer(feats, mean, std).astype(np.float32)
+                if not raw_input:
+                    Z = apply_standardizer(feats, mean, std).astype(np.float32)
                 with torch.inference_mode():
                     scores = (
                         model.reconstruction_error(
