@@ -751,9 +751,10 @@ def train_seq_gpu(
         raise ValueError("num_workers must be non-negative")
     cache_base = Path(cache_dir) if cache_dir is not None else None
     cache_item_bytes = torch.empty((), dtype=cache_torch_dtype).element_size()
+    cache_matrices = (*zmats, *val_mats) if cache_base is not None else tuple(zmats)
     estimated_cache_bytes = sum(
         max(0, len(matrix) - seq_len + 1) * seq_len * matrix.shape[1] * cache_item_bytes
-        for matrix in (*zmats, *val_mats)
+        for matrix in cache_matrices
     )
     wants_window_cache = cache_base is not None or ram_window_cache
     if wants_window_cache and estimated_cache_bytes > max_cache_gb * 1024**3:
@@ -800,7 +801,9 @@ def train_seq_gpu(
     dl = DataLoader(ds, shuffle=True, **loader_options)
     val_ds = SeqWindowsDataset(
         val_mats, seq_len, cache_path=val_cache, cache_dtype=cache_torch_dtype
-        , materialize_windows=ram_window_cache
+        # Keep validation lazy for RAM-only caching: it is a small once-per-epoch
+        # pass and materializing it needlessly raises the host-memory peak.
+        , materialize_windows=False
     )
     if len(val_ds) == 0:
         raise ValueError("Validation segments are shorter than seq_len.")
